@@ -226,6 +226,17 @@ impl SessionManager {
     pub async fn start_session(&self, session_id: &str) -> Result<(), ManagerError> {
         log::info!("[Manager] Starting session: {}", session_id);
 
+        // Быстрая проверка лимита с read lock (до дорогих операций)
+        if self.config.max_concurrent_sessions > 0 {
+            let sessions = self.sessions.read().await;
+            if sessions.len() >= self.config.max_concurrent_sessions {
+                return Err(ManagerError::SessionError(format!(
+                    "Maximum concurrent sessions limit reached: {}",
+                    self.config.max_concurrent_sessions
+                )));
+            }
+        }
+
         // Получить запись из БД (до захвата lock)
         let record = self
             .database
@@ -251,7 +262,7 @@ impl SessionManager {
             return Err(ManagerError::SessionAlreadyRunning(session_id.to_string()));
         }
 
-        // Проверить лимит одновременно запущенных сессий
+        // Перепроверить лимит с write lock (могло измениться пока делали DB lookup)
         if self.config.max_concurrent_sessions > 0
             && sessions.len() >= self.config.max_concurrent_sessions
         {
@@ -349,7 +360,13 @@ impl SessionManager {
                 // Сессия уже остановлена - это нормально
                 log::debug!("[Manager] Session already stopped");
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Логируем ошибку, но продолжаем removal (файл всё равно нужно удалить)
+                log::warn!(
+                    "[Manager] Failed to stop session, continuing with removal: {:?}",
+                    e
+                );
+            }
         }
 
         // Получить запись из БД
@@ -405,6 +422,7 @@ impl SessionManager {
 
     /// Список доступных сессий в /storage (файлы .session)
     pub async fn list_available_sessions(&self) -> Result<Vec<String>, ManagerError> {
+        const MAX_RESULTS: usize = 1000;
         let mut sessions = Vec::new();
 
         let mut entries = fs::read_dir(&self.config.storage_dir).await?;
@@ -416,6 +434,15 @@ impl SessionManager {
                     if ext == "session" {
                         if let Some(stem) = path.file_stem() {
                             sessions.push(stem.to_string_lossy().to_string());
+
+                            // Проверить лимит
+                            if sessions.len() >= MAX_RESULTS {
+                                log::warn!(
+                                    "[Manager] list_available_sessions reached max limit ({}), there may be more files",
+                                    MAX_RESULTS
+                                );
+                                break;
+                            }
                         }
                     }
                 }
@@ -427,6 +454,7 @@ impl SessionManager {
 
     /// Список новых сессий в /sessions (для регистрации)
     pub async fn list_pending_sessions(&self) -> Result<Vec<String>, ManagerError> {
+        const MAX_RESULTS: usize = 1000;
         let mut sessions = Vec::new();
 
         let mut entries = fs::read_dir(&self.config.sessions_dir).await?;
@@ -438,6 +466,15 @@ impl SessionManager {
                     if ext == "session" {
                         if let Some(stem) = path.file_stem() {
                             sessions.push(stem.to_string_lossy().to_string());
+
+                            // Проверить лимит
+                            if sessions.len() >= MAX_RESULTS {
+                                log::warn!(
+                                    "[Manager] list_pending_sessions reached max limit ({}), there may be more files",
+                                    MAX_RESULTS
+                                );
+                                break;
+                            }
                         }
                     }
                 }

@@ -63,11 +63,6 @@ impl SessionHandle {
         }
     }
 
-    /// Получить клон статуса Arc для обновления из сессии
-    pub fn status_arc(&self) -> Arc<RwLock<SessionStatus>> {
-        Arc::clone(&self.status)
-    }
-
     /// Получить текущий статус
     pub async fn get_status(&self) -> SessionStatus {
         self.status.read().await.clone()

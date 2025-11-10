@@ -68,10 +68,12 @@ impl TelegramSession {
         );
 
         if let Some(ref proxy) = session_data.proxy {
+            // Извлечь только host:port часть (после последнего @) для безопасного логирования
+            let safe_part = proxy.rsplit('@').next().unwrap_or("***");
             log::info!(
                 "[{}]   Proxy: {} (SOCKS5)",
                 session_id,
-                proxy.split('@').nth(1).unwrap_or("***")
+                safe_part
             );
         } else {
             log::info!("[{}]   Proxy: None (direct connection)", session_id);
@@ -412,7 +414,10 @@ impl TelegramSession {
         // Читаем app_id
         let mut stmt = conn.prepare("SELECT value FROM body WHERE key = 'app_id'")?;
         let app_id: i32 = if let State::Row = stmt.next()? {
-            stmt.read::<i64, _>(0)? as i32
+            let app_id_i64: i64 = stmt.read::<i64, _>(0)?;
+            app_id_i64
+                .try_into()
+                .map_err(|_| format!("app_id overflow: {} exceeds i32::MAX", app_id_i64))?
         } else {
             return Err("app_id not found".into());
         };
