@@ -1,0 +1,38 @@
+[package]
+name = "telegram-minimal-client"
+version = "0.1.0"
+edition = "2021"
+
+[profile.release]
+opt-level = "z"     # Optimize for size
+lto = true          # Enable Link Time Optimization
+codegen-units = 1   # Better optimization
+strip = true        # Strip symbols from binary
+panic = "abort"     # Smaller panic handler
+
+[features]
+default = ["proxy"]
+proxy = ["grammers-client/proxy", "grammers-mtsender/proxy"]
+
+[dependencies]
+# Grammers - используем local path (к grammers-master в той же директории)
+grammers-client = { path = "../grammers-master/grammers-client", features = ["proxy"] }
+grammers-session = { path = "../grammers-master/grammers-session" }
+grammers-mtsender = { path = "../grammers-master/grammers-mtsender", features = ["proxy"] }
+
+# Async runtime (минимальные features)
+tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "sync", "signal"] }
+
+# Logging
+log = "0.4"
+simple_logger = "4.0"
+
+# SQLite for reading body table
+sqlite = "0.37"
+
+# Phoenix Channel integration
+phoenix_channels_client = "0.1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
