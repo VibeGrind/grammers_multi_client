@@ -82,18 +82,13 @@ impl SessionDatabase {
         Ok(Connection::open(&self.db_path)?)
     }
 
-    /// Зарегистрировать новую сессию
+    /// Зарегистрировать новую сессию (атомарно с проверкой уникальности)
     pub fn register_session(
         &self,
         session_id: &str,
         file_path: &str,
     ) -> Result<(), ManagerError> {
         let conn = self.get_connection()?;
-
-        // Проверить что session_id не занят
-        if self.session_exists(session_id)? {
-            return Err(ManagerError::SessionAlreadyExists(session_id.to_string()));
-        }
 
         let now = chrono::Utc::now().timestamp();
 
@@ -108,11 +103,25 @@ impl SessionDatabase {
         stmt.bind((3, SessionDbStatus::Registered.as_str()))?;
         stmt.bind((4, now))?;
         stmt.bind((5, now))?;
-        stmt.next()?;
 
-        log::info!("[DB] Registered session: {}", session_id);
-
-        Ok(())
+        // Попытка вставки - PRIMARY KEY constraint обеспечит уникальность
+        match stmt.next() {
+            Ok(_) => {
+                log::info!("[DB] Registered session: {}", session_id);
+                Ok(())
+            }
+            Err(e) => {
+                let err_msg = e.to_string();
+                // Проверяем нарушение UNIQUE/PRIMARY KEY constraint
+                if err_msg.contains("UNIQUE constraint failed")
+                    || err_msg.contains("PRIMARY KEY")
+                {
+                    Err(ManagerError::SessionAlreadyExists(session_id.to_string()))
+                } else {
+                    Err(ManagerError::DatabaseError(err_msg))
+                }
+            }
+        }
     }
 
     /// Проверить существует ли сессия с таким ID

@@ -86,8 +86,10 @@ impl SessionHandle {
         )
     }
 
-    /// Отправить shutdown сигнал и дождаться завершения
+    /// Отправить shutdown сигнал и дождаться завершения (с timeout)
     pub async fn shutdown(mut self) -> Result<(), SessionError> {
+        use tokio::time::{timeout, Duration};
+
         log::info!("[{}] Initiating graceful shutdown", self.session_id);
 
         // Клонировать status_arc ДО начала операций, чтобы использовать после await
@@ -109,15 +111,16 @@ impl SessionHandle {
             }
         }
 
-        // Ждём завершения задачи
-        match self.task_handle.await {
-            Ok(Ok(())) => {
+        // Ждём завершения задачи с timeout (30 секунд)
+        let shutdown_timeout = Duration::from_secs(30);
+        match timeout(shutdown_timeout, self.task_handle).await {
+            Ok(Ok(Ok(()))) => {
                 log::info!("[{}] Session stopped successfully", self.session_id);
                 let mut status = status_arc.write().await;
                 *status = SessionStatus::Stopped;
                 Ok(())
             }
-            Ok(Err(e)) => {
+            Ok(Ok(Err(e))) => {
                 log::error!("[{}] Session stopped with error: {:?}", self.session_id, e);
                 let mut status = status_arc.write().await;
                 *status = SessionStatus::Error {
@@ -126,9 +129,26 @@ impl SessionHandle {
                 };
                 Err(e)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::error!("[{}] Task join error: {:?}", self.session_id, e);
                 let err = SessionError::Other(format!("Task join error: {}", e));
+                let mut status = status_arc.write().await;
+                *status = SessionStatus::Error {
+                    error: err.to_string(),
+                    occurred_at: Utc::now(),
+                };
+                Err(err)
+            }
+            Err(_) => {
+                log::error!(
+                    "[{}] Shutdown timeout after {} seconds",
+                    self.session_id,
+                    shutdown_timeout.as_secs()
+                );
+                let err = SessionError::Other(format!(
+                    "Shutdown timeout after {} seconds",
+                    shutdown_timeout.as_secs()
+                ));
                 let mut status = status_arc.write().await;
                 *status = SessionStatus::Error {
                     error: err.to_string(),
