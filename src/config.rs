@@ -81,6 +81,7 @@ impl ManagerConfig {
 
     /// Валидировать конфигурацию
     pub fn validate(&self) -> Result<(), String> {
+        // Phoenix URL validation
         if self.phoenix_url.is_empty() {
             return Err("phoenix_url cannot be empty".to_string());
         }
@@ -89,8 +90,64 @@ impl ManagerConfig {
             return Err("phoenix_url must start with ws:// or wss://".to_string());
         }
 
+        // Queue limit validation
         if self.update_queue_limit == 0 {
             return Err("update_queue_limit must be > 0".to_string());
+        }
+
+        // Database path validation
+        if self.database_path.as_os_str().is_empty() {
+            return Err("database_path cannot be empty".to_string());
+        }
+
+        // Directory uniqueness validation
+        if self.sessions_dir == self.storage_dir {
+            return Err(
+                "sessions_dir and storage_dir must be different directories".to_string(),
+            );
+        }
+
+        // Dangerous paths validation
+        let dangerous_paths = ["/etc", "/sys", "/proc", "/dev", "/boot", "/bin", "/sbin"];
+        for dangerous in &dangerous_paths {
+            if self.sessions_dir.starts_with(dangerous) {
+                return Err(format!(
+                    "Cannot use system directory for sessions_dir: {}",
+                    dangerous
+                ));
+            }
+            if self.storage_dir.starts_with(dangerous) {
+                return Err(format!(
+                    "Cannot use system directory for storage_dir: {}",
+                    dangerous
+                ));
+            }
+            if self.database_path.starts_with(dangerous) {
+                return Err(format!(
+                    "Cannot use system directory for database_path: {}",
+                    dangerous
+                ));
+            }
+        }
+
+        // Warning for relative paths (не ошибка, просто предупреждение в логах)
+        if !self.sessions_dir.is_absolute() {
+            log::warn!(
+                "sessions_dir is not an absolute path: {:?}. This may cause issues.",
+                self.sessions_dir
+            );
+        }
+        if !self.storage_dir.is_absolute() {
+            log::warn!(
+                "storage_dir is not an absolute path: {:?}. This may cause issues.",
+                self.storage_dir
+            );
+        }
+        if !self.database_path.is_absolute() {
+            log::warn!(
+                "database_path is not an absolute path: {:?}. This may cause issues.",
+                self.database_path
+            );
         }
 
         Ok(())

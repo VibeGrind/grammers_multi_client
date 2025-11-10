@@ -2,6 +2,7 @@ use crate::errors::ManagerError;
 use serde::{Deserialize, Serialize};
 use sqlite::{Connection, State};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 /// Статус сессии в базе данных
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,21 +43,16 @@ pub struct SessionRecord {
 /// Менеджер базы данных для хранения маппинга сессий
 pub struct SessionDatabase {
     db_path: String,
+    conn: Arc<Mutex<Connection>>,
 }
 
 impl SessionDatabase {
     /// Создать новый менеджер БД и инициализировать схему
     pub fn new(db_path: impl AsRef<Path>) -> Result<Self, ManagerError> {
         let db_path = db_path.as_ref().to_string_lossy().to_string();
-        let db = Self { db_path };
-        db.init_schema()?;
-        Ok(db)
-    }
+        let conn = Connection::open(&db_path)?;
 
-    /// Инициализировать схему базы данных
-    fn init_schema(&self) -> Result<(), ManagerError> {
-        let conn = Connection::open(&self.db_path)?;
-
+        // Инициализировать схему
         conn.execute(
             "
             CREATE TABLE IF NOT EXISTS sessions (
@@ -74,12 +70,17 @@ impl SessionDatabase {
             "CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions(status)",
         )?;
 
-        Ok(())
+        Ok(Self {
+            db_path,
+            conn: Arc::new(Mutex::new(conn)),
+        })
     }
 
-    /// Получить соединение с базой данных
-    fn get_connection(&self) -> Result<Connection, ManagerError> {
-        Ok(Connection::open(&self.db_path)?)
+    /// Получить guard для работы с соединением
+    fn get_connection(&self) -> std::sync::MutexGuard<Connection> {
+        self.conn
+            .lock()
+            .expect("Database connection mutex poisoned")
     }
 
     /// Зарегистрировать новую сессию (атомарно с проверкой уникальности)
@@ -88,7 +89,7 @@ impl SessionDatabase {
         session_id: &str,
         file_path: &str,
     ) -> Result<(), ManagerError> {
-        let conn = self.get_connection()?;
+        let conn = self.get_connection();
 
         let now = chrono::Utc::now().timestamp();
 
@@ -126,7 +127,7 @@ impl SessionDatabase {
 
     /// Проверить существует ли сессия с таким ID
     pub fn session_exists(&self, session_id: &str) -> Result<bool, ManagerError> {
-        let conn = self.get_connection()?;
+        let conn = self.get_connection();
 
         let query = "SELECT COUNT(*) FROM sessions WHERE session_id = ?";
         let mut stmt = conn.prepare(query)?;
@@ -142,7 +143,7 @@ impl SessionDatabase {
 
     /// Получить запись о сессии
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>, ManagerError> {
-        let conn = self.get_connection()?;
+        let conn = self.get_connection();
 
         let query = "
             SELECT session_id, file_path, status, registered_at, updated_at
@@ -172,7 +173,14 @@ impl SessionDatabase {
 
     /// Пометить сессию как удалённую
     pub fn mark_as_deleted(&self, session_id: &str) -> Result<(), ManagerError> {
-        let conn = self.get_connection()?;
+        // Сначала проверить существование сессии
+        if !self.session_exists(session_id)? {
+            return Err(ManagerError::SessionNotRegistered(
+                session_id.to_string(),
+            ));
+        }
+
+        let conn = self.get_connection();
 
         let now = chrono::Utc::now().timestamp();
 
@@ -195,7 +203,7 @@ impl SessionDatabase {
 
     /// Получить все зарегистрированные сессии
     pub fn get_registered_sessions(&self) -> Result<Vec<SessionRecord>, ManagerError> {
-        let conn = self.get_connection()?;
+        let conn = self.get_connection();
 
         let query = "
             SELECT session_id, file_path, status, registered_at, updated_at
@@ -228,7 +236,7 @@ impl SessionDatabase {
 
     /// Получить все сессии (включая удалённые)
     pub fn get_all_sessions(&self) -> Result<Vec<SessionRecord>, ManagerError> {
-        let conn = self.get_connection()?;
+        let conn = self.get_connection();
 
         let query = "
             SELECT session_id, file_path, status, registered_at, updated_at
@@ -259,7 +267,14 @@ impl SessionDatabase {
 
     /// Удалить запись о сессии из базы данных (физическое удаление)
     pub fn delete_session(&self, session_id: &str) -> Result<(), ManagerError> {
-        let conn = self.get_connection()?;
+        // Сначала проверить существование сессии
+        if !self.session_exists(session_id)? {
+            return Err(ManagerError::SessionNotRegistered(
+                session_id.to_string(),
+            ));
+        }
+
+        let conn = self.get_connection();
 
         let query = "DELETE FROM sessions WHERE session_id = ?";
 

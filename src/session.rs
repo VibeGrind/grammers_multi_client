@@ -343,14 +343,56 @@ impl TelegramSession {
             }
         };
 
-        // Отправить в Phoenix (fire-and-forget)
+        // Отправить в Phoenix с retry логикой
         if let Some(telegram_update) = telegram_update {
             if let Ok(json_value) = serde_json::to_value(&telegram_update) {
-                if let Err(e) = phoenix_channel
-                    .send_noreply("telegram_update", json_value)
-                    .await
-                {
-                    log::error!("[{}] Failed to send update to Phoenix: {:?}", session_id, e);
+                // Retry до 3 раз с exponential backoff
+                let max_retries = 3;
+                let mut last_error = None;
+
+                for retry in 0..max_retries {
+                    match phoenix_channel
+                        .send_noreply("telegram_update", json_value.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            // Успешно отправлено
+                            if retry > 0 {
+                                log::info!(
+                                    "[{}] Update sent successfully after {} retries",
+                                    session_id,
+                                    retry
+                                );
+                            }
+                            break;
+                        }
+                        Err(e) => {
+                            last_error = Some(e);
+                            if retry < max_retries - 1 {
+                                let delay_ms = 100 * 2_u64.pow(retry as u32);
+                                log::warn!(
+                                    "[{}] Send failed, retry {}/{} after {}ms: {:?}",
+                                    session_id,
+                                    retry + 1,
+                                    max_retries,
+                                    delay_ms,
+                                    last_error
+                                );
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+
+                // Если все retry провалились
+                if let Some(e) = last_error {
+                    log::error!(
+                        "[{}] Failed to send update to Phoenix after {} retries: {:?}",
+                        session_id,
+                        max_retries,
+                        e
+                    );
                 }
             } else {
                 log::error!("[{}] Failed to serialize update", session_id);
