@@ -124,7 +124,13 @@ impl TelegramSession {
             Ok(false) => {
                 log::error!("[{}] ✗ Session is NOT authorized", session_id);
                 handle.quit();
-                let _ = pool_task.await;
+                if let Err(join_err) = pool_task.await {
+                    log::warn!(
+                        "[{}] Pool task error during cleanup: {:?}",
+                        session_id,
+                        join_err
+                    );
+                }
                 return Err(SessionError::AuthorizationError(
                     "Session not authorized".to_string(),
                 ));
@@ -132,7 +138,13 @@ impl TelegramSession {
             Err(e) => {
                 log::error!("[{}] Authorization check failed: {:?}", session_id, e);
                 handle.quit();
-                let _ = pool_task.await;
+                if let Err(join_err) = pool_task.await {
+                    log::warn!(
+                        "[{}] Pool task error during cleanup: {:?}",
+                        session_id,
+                        join_err
+                    );
+                }
                 return Err(SessionError::AuthorizationError(format!(
                     "Authorization check failed: {}",
                     e
@@ -156,11 +168,32 @@ impl TelegramSession {
 
         // Получить Phoenix канал
         log::info!("[{}] Getting Phoenix channel...", session_id);
-        let phoenix_channel = config
+        let phoenix_channel = match config
             .phoenix_manager
             .get_or_create_channel(&session_id)
             .await
-            .map_err(|e| SessionError::PhoenixError(format!("Failed to get channel: {}", e)))?;
+        {
+            Ok(channel) => channel,
+            Err(e) => {
+                log::error!(
+                    "[{}] Failed to get Phoenix channel, cleaning up: {:?}",
+                    session_id,
+                    e
+                );
+                handle.quit();
+                if let Err(join_err) = pool_task.await {
+                    log::warn!(
+                        "[{}] Pool task error during cleanup: {:?}",
+                        session_id,
+                        join_err
+                    );
+                }
+                return Err(SessionError::PhoenixError(format!(
+                    "Failed to get channel: {}",
+                    e
+                )));
+            }
+        };
 
         log::info!("[{}] ✓ Phoenix channel ready", session_id);
 

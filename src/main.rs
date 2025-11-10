@@ -186,7 +186,7 @@ async fn run_cli_loop(manager: &SessionManager) {
                 }
             },
 
-            "list-available" => match manager.list_available_sessions() {
+            "list-available" => match manager.list_available_sessions().await {
                 Ok(sessions) => {
                     println!("Available sessions in storage ({}): {:?}", sessions.len(), sessions);
                 }
@@ -195,7 +195,7 @@ async fn run_cli_loop(manager: &SessionManager) {
                 }
             },
 
-            "list-pending" => match manager.list_pending_sessions() {
+            "list-pending" => match manager.list_pending_sessions().await {
                 Ok(sessions) => {
                     println!(
                         "Pending sessions for registration ({}): {:?}",

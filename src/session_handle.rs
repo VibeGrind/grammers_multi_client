@@ -53,12 +53,13 @@ impl SessionHandle {
         session_id: String,
         task_handle: JoinHandle<Result<(), SessionError>>,
         shutdown_tx: oneshot::Sender<()>,
+        status: Arc<RwLock<SessionStatus>>,
     ) -> Self {
         Self {
             session_id,
             task_handle,
             shutdown_tx: Some(shutdown_tx),
-            status: Arc::new(RwLock::new(SessionStatus::Starting)),
+            status,
         }
     }
 
@@ -113,6 +114,10 @@ impl SessionHandle {
 
         // Ждём завершения задачи с timeout (30 секунд)
         let shutdown_timeout = Duration::from_secs(30);
+
+        // Получить abort handle перед timeout
+        let abort_handle = self.task_handle.abort_handle();
+
         match timeout(shutdown_timeout, self.task_handle).await {
             Ok(Ok(Ok(()))) => {
                 log::info!("[{}] Session stopped successfully", self.session_id);
@@ -141,10 +146,17 @@ impl SessionHandle {
             }
             Err(_) => {
                 log::error!(
-                    "[{}] Shutdown timeout after {} seconds",
+                    "[{}] Shutdown timeout after {} seconds, aborting task",
                     self.session_id,
                     shutdown_timeout.as_secs()
                 );
+
+                // Force abort задачи
+                abort_handle.abort();
+
+                // Небольшая задержка для завершения abort
+                tokio::time::sleep(Duration::from_millis(100)).await;
+
                 let err = SessionError::Other(format!(
                     "Shutdown timeout after {} seconds",
                     shutdown_timeout.as_secs()

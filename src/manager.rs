@@ -5,9 +5,9 @@ use crate::phoenix_manager::PhoenixManager;
 use crate::session::{SessionConfig, TelegramSession};
 use crate::session_handle::{SessionHandle, SessionStatus};
 use std::collections::HashMap;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::fs;
 use tokio::sync::{oneshot, RwLock};
 
 /// Менеджер сессий - управляет жизненным циклом всех Telegram сессий
@@ -31,7 +31,7 @@ impl SessionManager {
         log::info!("=== Initializing Session Manager ===");
 
         // Создать директории если не существуют
-        Self::ensure_directories(&config)?;
+        Self::ensure_directories(&config).await?;
 
         // Инициализировать базу данных
         log::info!("Initializing database: {:?}", config.database_path);
@@ -52,15 +52,15 @@ impl SessionManager {
     }
 
     /// Убедиться что директории существуют
-    fn ensure_directories(config: &ManagerConfig) -> Result<(), ManagerError> {
+    async fn ensure_directories(config: &ManagerConfig) -> Result<(), ManagerError> {
         if !config.sessions_dir.exists() {
             log::info!("Creating sessions directory: {:?}", config.sessions_dir);
-            fs::create_dir_all(&config.sessions_dir)?;
+            fs::create_dir_all(&config.sessions_dir).await?;
         }
 
         if !config.storage_dir.exists() {
             log::info!("Creating storage directory: {:?}", config.storage_dir);
-            fs::create_dir_all(&config.storage_dir)?;
+            fs::create_dir_all(&config.storage_dir).await?;
         }
 
         Ok(())
@@ -70,6 +70,37 @@ impl SessionManager {
     /// session_name - имя файла БЕЗ расширения .session
     pub async fn register_session(&self, session_name: &str) -> Result<String, ManagerError> {
         log::info!("[Manager] Registering session: {}", session_name);
+
+        // Валидация session_name для предотвращения path traversal
+        if session_name.is_empty() {
+            return Err(ManagerError::SessionError(
+                "Session name cannot be empty".to_string(),
+            ));
+        }
+
+        if session_name.len() > 255 {
+            return Err(ManagerError::SessionError(
+                "Session name too long (max 255 characters)".to_string(),
+            ));
+        }
+
+        // Проверка на path traversal символы
+        if session_name.contains("..") || session_name.contains('/') || session_name.contains('\\')
+        {
+            return Err(ManagerError::SessionError(
+                "Invalid session name: path traversal detected".to_string(),
+            ));
+        }
+
+        // Разрешаем только alphanumeric, dash, underscore
+        if !session_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err(ManagerError::SessionError(
+                "Invalid session name: only alphanumeric, dash and underscore allowed".to_string(),
+            ));
+        }
 
         let session_id = session_name.to_string();
 
@@ -94,21 +125,54 @@ impl SessionManager {
             .storage_dir
             .join(format!("{}.session", session_name));
 
-        // Переместить файл
+        // Переместить файл (с поддержкой cross-filesystem move)
         log::info!(
             "[Manager] Moving session file: {:?} -> {:?}",
             source_path,
             target_path
         );
-        fs::rename(&source_path, &target_path).map_err(|e| {
-            ManagerError::IoError(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "Failed to move {:?} to {:?}: {}",
-                    source_path, target_path, e
-                ),
-            ))
-        })?;
+
+        // Попробовать rename (быстро, но работает только в пределах одной FS)
+        if let Err(e) = fs::rename(&source_path, &target_path).await {
+            // Если cross-device error (EXDEV = 18), fallback на copy+delete
+            if e.raw_os_error() == Some(18) {
+                log::info!(
+                    "[Manager] Cross-filesystem move detected, using copy+delete fallback"
+                );
+
+                // Копируем файл
+                fs::copy(&source_path, &target_path)
+                    .await
+                    .map_err(|copy_err| {
+                        ManagerError::IoError(std::io::Error::new(
+                            copy_err.kind(),
+                            format!(
+                                "Failed to copy {:?} to {:?}: {}",
+                                source_path, target_path, copy_err
+                            ),
+                        ))
+                    })?;
+
+                // Удаляем source (с rollback если failed)
+                if let Err(remove_err) = fs::remove_file(&source_path).await {
+                    // Откатываем копирование
+                    let _ = fs::remove_file(&target_path).await;
+                    return Err(ManagerError::IoError(std::io::Error::new(
+                        remove_err.kind(),
+                        format!(
+                            "Failed to remove source {:?} after copy: {}",
+                            source_path, remove_err
+                        ),
+                    )));
+                }
+            } else {
+                // Другая ошибка - возвращаем как есть
+                return Err(ManagerError::IoError(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to move {:?} to {:?}: {}", source_path, target_path, e),
+                )));
+            }
+        }
 
         // Зарегистрировать в БД с возможностью отката
         let target_path_str = target_path.to_string_lossy().to_string();
@@ -122,10 +186,35 @@ impl SessionManager {
                 log::error!(
                     "[Manager] Database registration failed, rolling back file move"
                 );
-                if let Err(rollback_err) = fs::rename(&target_path, &source_path) {
+
+                // Rollback с поддержкой cross-filesystem
+                let rollback_result =
+                    if let Err(rename_err) = fs::rename(&target_path, &source_path).await {
+                        // Если cross-device, используем copy+delete
+                        if rename_err.raw_os_error() == Some(18) {
+                            log::warn!("[Manager] Rollback using copy+delete");
+                            match fs::copy(&target_path, &source_path).await {
+                                Ok(_) => {
+                                    let _ = fs::remove_file(&target_path).await;
+                                    Ok(())
+                                }
+                                Err(copy_err) => Err(copy_err),
+                            }
+                        } else {
+                            Err(rename_err)
+                        }
+                    } else {
+                        Ok(())
+                    };
+
+                if let Err(rollback_err) = rollback_result {
                     log::error!(
-                        "[Manager] Failed to rollback file move: {:?}",
+                        "[Manager] CRITICAL: Failed to rollback file move: {:?}",
                         rollback_err
+                    );
+                    log::error!(
+                        "[Manager] Manual cleanup required for: {:?}",
+                        target_path
                     );
                 }
                 Err(e)
@@ -199,6 +288,7 @@ impl SessionManager {
             session_id.to_string(),
             task_handle,
             shutdown_tx,
+            Arc::clone(&status_arc),
         );
 
         // Сохранить в HashMap (атомарно с проверкой)
@@ -273,7 +363,7 @@ impl SessionManager {
             let file_path = PathBuf::from(&record.file_path);
             if file_path.exists() {
                 log::info!("[Manager] Deleting session file: {:?}", file_path);
-                fs::remove_file(&file_path)?;
+                fs::remove_file(&file_path).await?;
             }
         }
 
@@ -314,11 +404,11 @@ impl SessionManager {
     }
 
     /// Список доступных сессий в /storage (файлы .session)
-    pub fn list_available_sessions(&self) -> Result<Vec<String>, ManagerError> {
+    pub async fn list_available_sessions(&self) -> Result<Vec<String>, ManagerError> {
         let mut sessions = Vec::new();
 
-        for entry in fs::read_dir(&self.config.storage_dir)? {
-            let entry = entry?;
+        let mut entries = fs::read_dir(&self.config.storage_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
             if path.is_file() {
@@ -336,11 +426,11 @@ impl SessionManager {
     }
 
     /// Список новых сессий в /sessions (для регистрации)
-    pub fn list_pending_sessions(&self) -> Result<Vec<String>, ManagerError> {
+    pub async fn list_pending_sessions(&self) -> Result<Vec<String>, ManagerError> {
         let mut sessions = Vec::new();
 
-        for entry in fs::read_dir(&self.config.sessions_dir)? {
-            let entry = entry?;
+        let mut entries = fs::read_dir(&self.config.sessions_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
             let path = entry.path();
 
             if path.is_file() {
