@@ -195,8 +195,31 @@ impl SessionManager {
                             log::warn!("[Manager] Rollback using copy+delete");
                             match fs::copy(&target_path, &source_path).await {
                                 Ok(_) => {
-                                    let _ = fs::remove_file(&target_path).await;
-                                    Ok(())
+                                    // MUST succeed или rollback failed
+                                    if let Err(remove_err) = fs::remove_file(&target_path).await
+                                    {
+                                        log::error!(
+                                            "[Manager] CRITICAL: Rollback incomplete - file exists in both locations: {:?}",
+                                            target_path
+                                        );
+                                        log::error!(
+                                            "[Manager] Manual cleanup required: target={:?}, source={:?}",
+                                            target_path, source_path
+                                        );
+
+                                        // Попробовать удалить source чтобы вернуть в исходное состояние
+                                        let _ = fs::remove_file(&source_path).await;
+
+                                        Err(std::io::Error::new(
+                                            remove_err.kind(),
+                                            format!(
+                                                "Rollback failed: could not remove target {:?}: {}",
+                                                target_path, remove_err
+                                            ),
+                                        ))
+                                    } else {
+                                        Ok(())
+                                    }
                                 }
                                 Err(copy_err) => Err(copy_err),
                             }
@@ -331,10 +354,27 @@ impl SessionManager {
             )));
         }
 
-        // Удалить и закрыть Phoenix канал
-        if let Err(e) = self.phoenix_manager.remove_channel(session_id).await {
-            log::warn!("[Manager] Failed to remove Phoenix channel: {:?}", e);
-            // Продолжаем, так как сессия уже остановлена
+        // Удалить и закрыть Phoenix канал с retry
+        for retry in 0..3 {
+            match self.phoenix_manager.remove_channel(session_id).await {
+                Ok(()) => break,
+                Err(e) if retry < 2 => {
+                    log::warn!(
+                        "[Manager] Failed to remove Phoenix channel (retry {}/3): {:?}",
+                        retry + 1,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => {
+                    log::error!(
+                        "[Manager] CRITICAL: Phoenix channel cleanup failed after 3 retries: {:?}",
+                        e
+                    );
+                    // Force удаление из DashMap чтобы предотвратить memory leak
+                    self.phoenix_manager.force_remove_channel(session_id);
+                }
+            }
         }
 
         log::info!("[Manager] ✓ Session stopped: {}", session_id);

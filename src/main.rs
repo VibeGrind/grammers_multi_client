@@ -58,7 +58,7 @@ async fn run_cli_loop(manager: &SessionManager) {
     // CLI цикл с async I/O и обработкой Ctrl+C
     loop {
         print!("> ");
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush(); // Ignore flush errors (e.g., broken pipe)
 
         let input_fut = reader.next_line();
 
@@ -234,7 +234,7 @@ async fn shutdown_all_sessions(manager: &SessionManager) {
     println!("Stopping {} active session(s)...", active.len());
     for session_id in active {
         print!("  Stopping {}: ", session_id);
-        io::stdout().flush().unwrap();
+        let _ = io::stdout().flush(); // Ignore flush errors
         match manager.stop_session(&session_id).await {
             Ok(()) => println!("✓"),
             Err(e) => println!("✗ Error: {}", e),

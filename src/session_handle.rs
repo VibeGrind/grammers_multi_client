@@ -171,3 +171,21 @@ impl SessionHandle {
         &self.session_id
     }
 }
+
+impl Drop for SessionHandle {
+    fn drop(&mut self) {
+        // Если shutdown_tx еще не использован (shutdown() не был вызван)
+        if let Some(tx) = self.shutdown_tx.take() {
+            // Попытка graceful shutdown
+            let _ = tx.send(());
+
+            // Force abort задачи на случай если shutdown signal не обработан
+            self.task_handle.abort();
+
+            log::warn!(
+                "[{}] SessionHandle dropped without explicit shutdown, task aborted",
+                self.session_id
+            );
+        }
+    }
+}

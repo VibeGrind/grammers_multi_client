@@ -141,7 +141,11 @@ impl PhoenixManager {
                     session_id,
                     e
                 );
-                // Не возвращаем ошибку, так как канал уже удалён из кеша
+                // Возвращаем ошибку чтобы caller мог retry
+                return Err(ManagerError::PhoenixError(format!(
+                    "Failed to leave channel: {:?}",
+                    e
+                )));
             } else {
                 log::info!("[Phoenix] Channel left successfully: {}", session_id);
             }
@@ -149,6 +153,18 @@ impl PhoenixManager {
             log::debug!("[Phoenix] No channel to remove for: {}", session_id);
         }
         Ok(())
+    }
+
+    /// Force удалить канал из DashMap без graceful leave
+    /// Используется когда leave() постоянно fails
+    pub fn force_remove_channel(&self, session_id: &str) {
+        if let Some((_, channel)) = self.channels.remove(session_id) {
+            log::warn!(
+                "[Phoenix] Force removed channel without graceful leave: {}",
+                session_id
+            );
+            drop(channel); // Явно drop, connection закроется
+        }
     }
 
     /// Получить количество активных каналов

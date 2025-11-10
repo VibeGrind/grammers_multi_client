@@ -371,7 +371,9 @@ impl TelegramSession {
                         Err(e) => {
                             last_error = Some(e);
                             if retry < max_retries - 1 {
-                                let delay_ms = 100 * 2_u64.pow(retry as u32);
+                                const MAX_RETRY_DELAY_MS: u64 = 30_000; // 30 seconds max
+                                let delay_ms =
+                                    (100 * 2_u64.saturating_pow(retry as u32)).min(MAX_RETRY_DELAY_MS);
                                 log::warn!(
                                     "[{}] Send failed, retry {}/{} after {}ms: {:?}",
                                     session_id,
