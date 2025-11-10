@@ -116,15 +116,7 @@ impl SessionManager {
     pub async fn start_session(&self, session_id: &str) -> Result<(), ManagerError> {
         log::info!("[Manager] Starting session: {}", session_id);
 
-        // Проверить что сессия не запущена
-        {
-            let sessions = self.sessions.read().await;
-            if sessions.contains_key(session_id) {
-                return Err(ManagerError::SessionAlreadyRunning(session_id.to_string()));
-            }
-        }
-
-        // Получить запись из БД
+        // Получить запись из БД (до захвата lock)
         let record = self
             .database
             .get_session(session_id)?
@@ -141,17 +133,19 @@ impl SessionManager {
             return Err(ManagerError::SessionFileNotFound(session_id.to_string()));
         }
 
-        // Создать shutdown канал
+        // Захватить write lock на весь процесс (fix TOCTOU race condition)
+        let mut sessions = self.sessions.write().await;
+
+        // Проверить что сессия не запущена (атомарно с добавлением)
+        if sessions.contains_key(session_id) {
+            return Err(ManagerError::SessionAlreadyRunning(session_id.to_string()));
+        }
+
+        // Создать shutdown канал (один раз!)
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        // Создать SessionHandle
-        let session_handle = SessionHandle::new(
-            session_id.to_string(),
-            tokio::spawn(async { Ok(()) }), // Временная заглушка, обновим ниже
-            shutdown_tx,
-        );
-
-        let status_arc = session_handle.status_arc();
+        // Создать status Arc
+        let status_arc = Arc::new(RwLock::new(SessionStatus::Starting));
 
         // Создать конфигурацию сессии
         let session_config = SessionConfig {
@@ -162,53 +156,22 @@ impl SessionManager {
             catch_up: self.config.catch_up,
         };
 
-        // Запустить сессию в отдельной задаче
+        // Запустить сессию в отдельной задаче (один раз!)
         let task_handle = tokio::spawn(TelegramSession::run(
             session_config,
             shutdown_rx,
             Arc::clone(&status_arc),
         ));
 
-        // Создать правильный SessionHandle с реальным task_handle
-        let (shutdown_tx, shutdown_rx_new) = oneshot::channel();
-        let session_handle_real = SessionHandle::new(
+        // Создать SessionHandle (один раз!)
+        let session_handle = SessionHandle::new(
             session_id.to_string(),
             task_handle,
             shutdown_tx,
         );
 
-        // Обновляем status_arc на правильный
-        // (Здесь нужно переделать, чтобы избежать создания двух handle)
-        // Временное решение: используем только один handle
-
-        // Перезапустим с правильными параметрами
-        let (shutdown_tx_final, shutdown_rx_final) = oneshot::channel();
-
-        let session_config_final = SessionConfig {
-            session_id: session_id.to_string(),
-            session_path: record.file_path.clone(),
-            phoenix_manager: self.phoenix_manager.as_ref().clone(),
-            update_queue_limit: self.config.update_queue_limit,
-            catch_up: self.config.catch_up,
-        };
-
-        let task_handle_final = tokio::spawn(TelegramSession::run(
-            session_config_final,
-            shutdown_rx_final,
-            Arc::clone(&status_arc),
-        ));
-
-        let session_handle_final = SessionHandle::new(
-            session_id.to_string(),
-            task_handle_final,
-            shutdown_tx_final,
-        );
-
-        // Сохранить в HashMap
-        {
-            let mut sessions = self.sessions.write().await;
-            sessions.insert(session_id.to_string(), session_handle_final);
-        }
+        // Сохранить в HashMap (атомарно с проверкой)
+        sessions.insert(session_id.to_string(), session_handle);
 
         log::info!("[Manager] ✓ Session started: {}", session_id);
 
@@ -253,9 +216,16 @@ impl SessionManager {
     ) -> Result<(), ManagerError> {
         log::info!("[Manager] Removing session: {}", session_id);
 
-        // Остановить если запущена
-        if self.is_session_running(session_id).await {
-            self.stop_session(session_id).await?;
+        // Попытаться остановить (fix race condition - не проверяем is_running отдельно)
+        match self.stop_session(session_id).await {
+            Ok(()) => {
+                log::info!("[Manager] Session stopped before removal");
+            }
+            Err(ManagerError::SessionNotRunning(_)) => {
+                // Сессия уже остановлена - это нормально
+                log::debug!("[Manager] Session already stopped");
+            }
+            Err(e) => return Err(e),
         }
 
         // Получить запись из БД

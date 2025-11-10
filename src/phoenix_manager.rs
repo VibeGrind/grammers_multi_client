@@ -64,13 +64,15 @@ impl PhoenixManager {
         &self,
         session_id: &str,
     ) -> Result<Arc<Channel>, ManagerError> {
-        // Проверяем есть ли уже канал в кеше
+        use dashmap::mapref::entry::Entry;
+
+        // Быстрая проверка существующего канала
         if let Some(channel) = self.channels.get(session_id) {
             log::debug!("[Phoenix] Using cached channel for session: {}", session_id);
             return Ok(Arc::clone(channel.value()));
         }
 
-        // Создаём новый канал
+        // Создаём новый канал (вне лока)
         let topic = format!("telegram:updates:{}", session_id);
         log::info!("[Phoenix] Creating channel for topic: {}", topic);
 
@@ -84,16 +86,20 @@ impl PhoenixManager {
 
         let channel_arc = Arc::new(channel);
 
-        // Сохраняем в кеш
-        self.channels
-            .insert(session_id.to_string(), Arc::clone(&channel_arc));
-
-        log::info!(
-            "[Phoenix] Channel created and cached for session: {}",
-            session_id
-        );
-
-        Ok(channel_arc)
+        // Атомарная вставка: insert-if-absent (fix race condition)
+        match self.channels.entry(session_id.to_string()) {
+            Entry::Occupied(entry) => {
+                // Другая задача уже создала канал - используем его
+                log::debug!("[Phoenix] Channel created by another task, using existing");
+                Ok(Arc::clone(entry.get()))
+            }
+            Entry::Vacant(entry) => {
+                // Мы первые - вставляем наш канал
+                entry.insert(Arc::clone(&channel_arc));
+                log::info!("[Phoenix] Channel created and cached for session: {}", session_id);
+                Ok(channel_arc)
+            }
+        }
     }
 
     /// Отправить обновление в канал сессии (fire-and-forget)

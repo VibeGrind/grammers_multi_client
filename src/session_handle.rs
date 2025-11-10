@@ -90,8 +90,14 @@ impl SessionHandle {
     pub async fn shutdown(mut self) -> Result<(), SessionError> {
         log::info!("[{}] Initiating graceful shutdown", self.session_id);
 
-        // Обновляем статус
-        self.update_status(SessionStatus::Stopping).await;
+        // Клонировать status_arc ДО начала операций, чтобы использовать после await
+        let status_arc = Arc::clone(&self.status);
+
+        // Обновляем статус через клонированный Arc
+        {
+            let mut status = status_arc.write().await;
+            *status = SessionStatus::Stopping;
+        }
 
         // Отправляем сигнал остановки
         if let Some(tx) = self.shutdown_tx.take() {
@@ -107,26 +113,27 @@ impl SessionHandle {
         match self.task_handle.await {
             Ok(Ok(())) => {
                 log::info!("[{}] Session stopped successfully", self.session_id);
-                self.update_status(SessionStatus::Stopped).await;
+                let mut status = status_arc.write().await;
+                *status = SessionStatus::Stopped;
                 Ok(())
             }
             Ok(Err(e)) => {
                 log::error!("[{}] Session stopped with error: {:?}", self.session_id, e);
-                self.update_status(SessionStatus::Error {
+                let mut status = status_arc.write().await;
+                *status = SessionStatus::Error {
                     error: e.to_string(),
                     occurred_at: Utc::now(),
-                })
-                .await;
+                };
                 Err(e)
             }
             Err(e) => {
                 log::error!("[{}] Task join error: {:?}", self.session_id, e);
                 let err = SessionError::Other(format!("Task join error: {}", e));
-                self.update_status(SessionStatus::Error {
+                let mut status = status_arc.write().await;
+                *status = SessionStatus::Error {
                     error: err.to_string(),
                     occurred_at: Utc::now(),
-                })
-                .await;
+                };
                 Err(err)
             }
         }

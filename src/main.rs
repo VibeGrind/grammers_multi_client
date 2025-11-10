@@ -10,7 +10,7 @@ use config::ManagerConfig;
 use manager::SessionManager;
 use std::io::{self, Write};
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main] // Используем multi_thread runtime по умолчанию
 async fn main() {
     // Инициализация логирования
     simple_logger::SimpleLogger::new()
@@ -39,15 +39,26 @@ async fn main() {
     println!("  Storage dir: {:?}", manager.config().storage_dir);
     println!("  Database: {:?}\n", manager.config().database_path);
 
-    // CLI цикл
+    // Запустить CLI loop
+    run_cli_loop(&manager).await;
+}
+
+async fn run_cli_loop(manager: &SessionManager) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin).lines();
+
+    // CLI цикл с async I/O
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
 
-        let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            continue;
-        }
+        let input = match reader.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break, // EOF
+            Err(_) => continue,
+        };
 
         let input = input.trim();
         if input.is_empty() {

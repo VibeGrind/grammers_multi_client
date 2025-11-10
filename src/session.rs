@@ -218,11 +218,23 @@ impl TelegramSession {
         log::info!("[{}] Syncing update state...", session_id);
         updates_stream.sync_update_state();
 
+        // Явно drop stream перед остановкой pool
+        log::debug!("[{}] Dropping update stream", session_id);
+        drop(updates_stream);
+
         log::info!("[{}] Stopping MTProto connection...", session_id);
         handle.quit();
 
         log::info!("[{}] Waiting for pool to stop...", session_id);
-        let _ = pool_task.await;
+        // Обрабатываем ошибки pool task
+        match pool_task.await {
+            Ok(_) => {
+                log::debug!("[{}] Pool task completed successfully", session_id);
+            }
+            Err(e) => {
+                log::warn!("[{}] Pool task join error: {:?}", session_id, e);
+            }
+        }
 
         log::info!("[{}] ✓ Shutdown complete", session_id);
 
@@ -366,8 +378,10 @@ impl TelegramSession {
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         use sqlite::State;
 
-        let query = format!("SELECT value FROM body WHERE key = '{}'", key);
-        let mut stmt = conn.prepare(&query)?;
+        // Используем параметризованный запрос для защиты от SQL injection
+        let query = "SELECT value FROM body WHERE key = ?";
+        let mut stmt = conn.prepare(query)?;
+        stmt.bind((1, key))?;
 
         let value = if let State::Row = stmt.next()? {
             stmt.read::<String, _>(0)?
