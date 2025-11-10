@@ -100,16 +100,37 @@ impl SessionManager {
             source_path,
             target_path
         );
-        fs::rename(&source_path, &target_path)?;
+        fs::rename(&source_path, &target_path).map_err(|e| {
+            ManagerError::IoError(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "Failed to move {:?} to {:?}: {}",
+                    source_path, target_path, e
+                ),
+            ))
+        })?;
 
-        // Зарегистрировать в БД
+        // Зарегистрировать в БД с возможностью отката
         let target_path_str = target_path.to_string_lossy().to_string();
-        self.database
-            .register_session(&session_id, &target_path_str)?;
-
-        log::info!("[Manager] ✓ Session registered: {}", session_id);
-
-        Ok(session_id)
+        match self.database.register_session(&session_id, &target_path_str) {
+            Ok(()) => {
+                log::info!("[Manager] ✓ Session registered: {}", session_id);
+                Ok(session_id)
+            }
+            Err(e) => {
+                // Откатить перемещение файла
+                log::error!(
+                    "[Manager] Database registration failed, rolling back file move"
+                );
+                if let Err(rollback_err) = fs::rename(&target_path, &source_path) {
+                    log::error!(
+                        "[Manager] Failed to rollback file move: {:?}",
+                        rollback_err
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Запустить сессию из /storage
@@ -139,6 +160,16 @@ impl SessionManager {
         // Проверить что сессия не запущена (атомарно с добавлением)
         if sessions.contains_key(session_id) {
             return Err(ManagerError::SessionAlreadyRunning(session_id.to_string()));
+        }
+
+        // Проверить лимит одновременно запущенных сессий
+        if self.config.max_concurrent_sessions > 0
+            && sessions.len() >= self.config.max_concurrent_sessions
+        {
+            return Err(ManagerError::SessionError(format!(
+                "Maximum concurrent sessions limit reached: {}",
+                self.config.max_concurrent_sessions
+            )));
         }
 
         // Создать shutdown канал (один раз!)
@@ -199,8 +230,11 @@ impl SessionManager {
             )));
         }
 
-        // Удалить канал из Phoenix менеджера
-        self.phoenix_manager.remove_channel(session_id);
+        // Удалить и закрыть Phoenix канал
+        if let Err(e) = self.phoenix_manager.remove_channel(session_id).await {
+            log::warn!("[Manager] Failed to remove Phoenix channel: {:?}", e);
+            // Продолжаем, так как сессия уже остановлена
+        }
 
         log::info!("[Manager] ✓ Session stopped: {}", session_id);
 

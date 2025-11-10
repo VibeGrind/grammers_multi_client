@@ -20,6 +20,9 @@ pub struct ManagerConfig {
 
     /// Catch up обновлений при старте
     pub catch_up: bool,
+
+    /// Максимальное количество одновременно запущенных сессий (0 = без лимита)
+    pub max_concurrent_sessions: usize,
 }
 
 impl Default for ManagerConfig {
@@ -31,6 +34,7 @@ impl Default for ManagerConfig {
             database_path: PathBuf::from("./manager.db"),
             update_queue_limit: 10,
             catch_up: true,
+            max_concurrent_sessions: 0, // 0 = без лимита
         }
     }
 }
@@ -66,7 +70,30 @@ impl ManagerConfig {
             config.catch_up = catch_up.to_lowercase() == "true";
         }
 
+        if let Ok(max_sessions) = std::env::var("MAX_CONCURRENT_SESSIONS") {
+            if let Ok(val) = max_sessions.parse() {
+                config.max_concurrent_sessions = val;
+            }
+        }
+
         config
+    }
+
+    /// Валидировать конфигурацию
+    pub fn validate(&self) -> Result<(), String> {
+        if self.phoenix_url.is_empty() {
+            return Err("phoenix_url cannot be empty".to_string());
+        }
+
+        if !self.phoenix_url.starts_with("ws://") && !self.phoenix_url.starts_with("wss://") {
+            return Err("phoenix_url must start with ws:// or wss://".to_string());
+        }
+
+        if self.update_queue_limit == 0 {
+            return Err("update_queue_limit must be > 0".to_string());
+        }
+
+        Ok(())
     }
 
     /// Создать конфигурацию с кастомными параметрами

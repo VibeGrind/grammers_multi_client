@@ -129,11 +129,26 @@ impl PhoenixManager {
         Ok(())
     }
 
-    /// Удалить канал из кеша (при остановке сессии)
-    pub fn remove_channel(&self, session_id: &str) {
-        if self.channels.remove(session_id).is_some() {
-            log::info!("[Phoenix] Channel removed from cache: {}", session_id);
+    /// Удалить канал и закрыть соединение (при остановке сессии)
+    pub async fn remove_channel(&self, session_id: &str) -> Result<(), ManagerError> {
+        if let Some((_, channel)) = self.channels.remove(session_id) {
+            log::info!("[Phoenix] Removing channel for session: {}", session_id);
+
+            // Явно покинуть канал на Phoenix сервере
+            if let Err(e) = channel.leave().await {
+                log::warn!(
+                    "[Phoenix] Failed to leave channel for {}: {:?}",
+                    session_id,
+                    e
+                );
+                // Не возвращаем ошибку, так как канал уже удалён из кеша
+            } else {
+                log::info!("[Phoenix] Channel left successfully: {}", session_id);
+            }
+        } else {
+            log::debug!("[Phoenix] No channel to remove for: {}", session_id);
         }
+        Ok(())
     }
 
     /// Получить количество активных каналов

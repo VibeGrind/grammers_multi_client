@@ -24,6 +24,12 @@ async fn main() {
     // Загрузить конфигурацию
     let config = ManagerConfig::from_env();
 
+    // Валидировать конфигурацию
+    if let Err(e) = config.validate() {
+        eprintln!("Invalid configuration: {}", e);
+        std::process::exit(1);
+    }
+
     // Создать SessionManager
     let manager = match SessionManager::new(config).await {
         Ok(m) => m,
@@ -49,24 +55,36 @@ async fn run_cli_loop(manager: &SessionManager) {
     let stdin = tokio::io::stdin();
     let mut reader = BufReader::new(stdin).lines();
 
-    // CLI цикл с async I/O
+    // CLI цикл с async I/O и обработкой Ctrl+C
     loop {
         print!("> ");
         io::stdout().flush().unwrap();
 
-        let input = match reader.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => break, // EOF
-            Err(_) => continue,
-        };
+        let input_fut = reader.next_line();
 
-        let input = input.trim();
-        if input.is_empty() {
-            continue;
-        }
+        tokio::select! {
+            // Получен Ctrl+C
+            _ = tokio::signal::ctrl_c() => {
+                println!("\n\nReceived Ctrl+C, shutting down gracefully...");
+                shutdown_all_sessions(manager).await;
+                break;
+            }
 
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        let command = parts[0];
+            // Получена строка ввода
+            input = input_fut => {
+                let input = match input {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break, // EOF
+                    Err(_) => continue,
+                };
+
+                let input = input.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                let parts: Vec<&str> = input.split_whitespace().collect();
+                let command = parts[0];
 
         match command {
             "help" => {
@@ -192,15 +210,7 @@ async fn run_cli_loop(manager: &SessionManager) {
 
             "exit" | "quit" => {
                 println!("Shutting down...");
-                // Остановить все активные сессии
-                let active = manager.list_active_sessions().await;
-                for session_id in active {
-                    println!("Stopping session: {}", session_id);
-                    if let Err(e) = manager.stop_session(&session_id).await {
-                        println!("Error stopping {}: {}", session_id, e);
-                    }
-                }
-                println!("✓ Goodbye!");
+                shutdown_all_sessions(manager).await;
                 break;
             }
 
@@ -208,7 +218,29 @@ async fn run_cli_loop(manager: &SessionManager) {
                 println!("Unknown command: {}. Type 'help' for available commands.", command);
             }
         }
+            } // конец input = input_fut
+        } // конец tokio::select!
+    } // конец loop
+}
+
+/// Graceful shutdown всех активных сессий
+async fn shutdown_all_sessions(manager: &SessionManager) {
+    let active = manager.list_active_sessions().await;
+    if active.is_empty() {
+        println!("No active sessions to stop");
+        return;
     }
+
+    println!("Stopping {} active session(s)...", active.len());
+    for session_id in active {
+        print!("  Stopping {}: ", session_id);
+        io::stdout().flush().unwrap();
+        match manager.stop_session(&session_id).await {
+            Ok(()) => println!("✓"),
+            Err(e) => println!("✗ Error: {}", e),
+        }
+    }
+    println!("✓ All sessions stopped. Goodbye!");
 }
 
 fn print_help() {
