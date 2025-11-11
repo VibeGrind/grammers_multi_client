@@ -182,10 +182,14 @@ impl Drop for SessionHandle {
             // Force abort задачи на случай если shutdown signal не обработан
             self.task_handle.abort();
 
-            log::warn!(
-                "[{}] SessionHandle dropped without explicit shutdown, task aborted",
-                self.session_id
-            );
+            // Safely log without risking panic in destructor
+            let session_id = self.session_id.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                log::warn!(
+                    "[{}] SessionHandle dropped without explicit shutdown, task aborted",
+                    session_id
+                );
+            }));
         }
     }
 }

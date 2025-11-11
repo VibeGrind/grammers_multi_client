@@ -206,15 +206,19 @@ impl SessionManager {
                                             "[Manager] Manual cleanup required: target={:?}, source={:?}",
                                             target_path, source_path
                                         );
+                                        log::error!(
+                                            "[Manager] Source file preserved at {:?} - DO NOT DELETE manually",
+                                            source_path
+                                        );
 
-                                        // Попробовать удалить source чтобы вернуть в исходное состояние
-                                        let _ = fs::remove_file(&source_path).await;
+                                        // Do NOT delete source_path - it contains the correct session file!
+                                        // Manual intervention required but data is NOT lost
 
                                         Err(std::io::Error::new(
                                             remove_err.kind(),
                                             format!(
-                                                "Rollback failed: could not remove target {:?}: {}",
-                                                target_path, remove_err
+                                                "Rollback failed: target at {:?} could not be removed, source preserved at {:?}",
+                                                target_path, source_path
                                             ),
                                         ))
                                     } else {

@@ -80,7 +80,11 @@ impl SessionDatabase {
     fn get_connection(&self) -> std::sync::MutexGuard<Connection> {
         self.conn
             .lock()
-            .expect("Database connection mutex poisoned")
+            .unwrap_or_else(|poisoned| {
+                log::error!("Database connection mutex was poisoned, recovering guard");
+                log::error!("This indicates a panic occurred while holding the database lock");
+                poisoned.into_inner()
+            })
     }
 
     /// Зарегистрировать новую сессию (атомарно с проверкой уникальности)
