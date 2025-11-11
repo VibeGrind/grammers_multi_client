@@ -4,6 +4,7 @@ use phoenix_channels_client::{Channel, Client as PhxClient, Config};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 /// Структура для Telegram обновления
 #[derive(Debug, Serialize, Deserialize)]
@@ -32,6 +33,9 @@ pub struct PhoenixManager {
 
     /// Кеш каналов: session_id → Arc<Channel>
     channels: Arc<DashMap<String, Arc<Channel>>>,
+
+    /// Блокировки для предотвращения гонки при создании каналов
+    creation_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl PhoenixManager {
@@ -55,6 +59,7 @@ impl PhoenixManager {
         Ok(Self {
             client: Arc::new(client),
             channels: Arc::new(DashMap::new()),
+            creation_locks: Arc::new(DashMap::new()),
         })
     }
 
@@ -64,15 +69,30 @@ impl PhoenixManager {
         &self,
         session_id: &str,
     ) -> Result<Arc<Channel>, ManagerError> {
-        use dashmap::mapref::entry::Entry;
-
-        // Быстрая проверка существующего канала
+        // Быстрая проверка существующего канала (без блокировки)
         if let Some(channel) = self.channels.get(session_id) {
             log::debug!("[Phoenix] Using cached channel for session: {}", session_id);
             return Ok(Arc::clone(channel.value()));
         }
 
-        // Создаём новый канал (вне лока)
+        // Получить или создать блокировку для этого session_id
+        // Это предотвращает создание нескольких каналов одновременно
+        let lock = self
+            .creation_locks
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+
+        // Захватить блокировку (только один поток создаст канал)
+        let _guard = lock.lock().await;
+
+        // Double-check: другой поток мог создать канал пока мы ждали блокировку
+        if let Some(channel) = self.channels.get(session_id) {
+            log::debug!("[Phoenix] Channel created by another task, using existing");
+            return Ok(Arc::clone(channel.value()));
+        }
+
+        // Теперь создаём новый канал (защищено блокировкой)
         let topic = format!("telegram:updates:{}", session_id);
         log::info!("[Phoenix] Creating channel for topic: {}", topic);
 
@@ -86,20 +106,19 @@ impl PhoenixManager {
 
         let channel_arc = Arc::new(channel);
 
-        // Атомарная вставка: insert-if-absent (fix race condition)
-        match self.channels.entry(session_id.to_string()) {
-            Entry::Occupied(entry) => {
-                // Другая задача уже создала канал - используем его
-                log::debug!("[Phoenix] Channel created by another task, using existing");
-                Ok(Arc::clone(entry.get()))
-            }
-            Entry::Vacant(entry) => {
-                // Мы первые - вставляем наш канал
-                entry.insert(Arc::clone(&channel_arc));
-                log::info!("[Phoenix] Channel created and cached for session: {}", session_id);
-                Ok(channel_arc)
-            }
-        }
+        // Вставляем в кеш
+        self.channels
+            .insert(session_id.to_string(), Arc::clone(&channel_arc));
+
+        log::info!(
+            "[Phoenix] Channel created and cached for session: {}",
+            session_id
+        );
+
+        // Очистка: удаляем блокировку для экономии памяти
+        self.creation_locks.remove(session_id);
+
+        Ok(channel_arc)
     }
 
     /// Отправить обновление в канал сессии (fire-and-forget)
@@ -186,6 +205,7 @@ impl Clone for PhoenixManager {
         Self {
             client: Arc::clone(&self.client),
             channels: Arc::clone(&self.channels),
+            creation_locks: Arc::clone(&self.creation_locks),
         }
     }
 }

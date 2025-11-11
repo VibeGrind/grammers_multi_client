@@ -275,11 +275,8 @@ impl SessionManager {
             return Err(ManagerError::SessionNotRegistered(session_id.to_string()));
         }
 
-        // Проверить что файл существует
-        let session_path = PathBuf::from(&record.file_path);
-        if !session_path.exists() {
-            return Err(ManagerError::SessionFileNotFound(session_id.to_string()));
-        }
+        // Файл будет проверен при открытии в TelegramSession::run (избегаем TOCTOU)
+        // Если файл не существует или недоступен, получим ясную ошибку оттуда
 
         // Захватить write lock на весь процесс (fix TOCTOU race condition)
         let mut sessions = self.sessions.write().await;
@@ -422,9 +419,24 @@ impl SessionManager {
         // Удалить файл если нужно
         if delete_file {
             let file_path = PathBuf::from(&record.file_path);
-            if file_path.exists() {
-                log::info!("[Manager] Deleting session file: {:?}", file_path);
-                fs::remove_file(&file_path).await?;
+            log::info!("[Manager] Deleting session file: {:?}", file_path);
+
+            // Попытаться удалить без предварительной проверки (избегаем TOCTOU)
+            match fs::remove_file(&file_path).await {
+                Ok(()) => log::info!("[Manager] Session file deleted successfully"),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    log::warn!(
+                        "[Manager] Session file already deleted or not found: {:?}",
+                        file_path
+                    );
+                    // Не ошибка - файла нет, что и требовалось
+                }
+                Err(e) => {
+                    return Err(ManagerError::FileSystemError(format!(
+                        "Failed to delete session file {:?}: {}",
+                        file_path, e
+                    )));
+                }
             }
         }
 

@@ -389,14 +389,23 @@ impl TelegramSession {
                     }
                 }
 
-                // Если все retry провалились
+                // Если все retry провалились - это DATA LOSS
                 if let Some(e) = last_error {
                     log::error!(
-                        "[{}] Failed to send update to Phoenix after {} retries: {:?}",
+                        "[{}] CRITICAL DATA LOSS: Failed to send update to Phoenix after {} retries: {:?}",
                         session_id,
                         max_retries,
                         e
                     );
+                    log::error!(
+                        "[{}] Update PERMANENTLY LOST. Phoenix server may be down or unreachable.",
+                        session_id
+                    );
+                    log::error!(
+                        "[{}] Consider stopping session if Phoenix connectivity issues persist.",
+                        session_id
+                    );
+                    // TODO: Implement persistent queue or automatic session shutdown on repeated failures
                 }
             } else {
                 log::error!("[{}] Failed to serialize update", session_id);
@@ -410,10 +419,7 @@ impl TelegramSession {
 
         let conn = Connection::open(session_path)?;
 
-        // Установить user_version = 1 для существующей grammers сессии
-        conn.execute("PRAGMA user_version = 1")?;
-
-        // Читаем app_id
+        // Читаем app_id (user_version устанавливается при создании сессии, не нужно писать при загрузке)
         let mut stmt = conn.prepare("SELECT value FROM body WHERE key = 'app_id'")?;
         let app_id: i32 = if let State::Row = stmt.next()? {
             let app_id_i64: i64 = stmt.read::<i64, _>(0)?;

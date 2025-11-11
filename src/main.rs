@@ -223,23 +223,37 @@ async fn run_cli_loop(manager: &SessionManager) {
     } // конец loop
 }
 
-/// Graceful shutdown всех активных сессий
+/// Graceful shutdown всех активных сессий (параллельно для скорости)
 async fn shutdown_all_sessions(manager: &SessionManager) {
+    use futures::stream::{self, StreamExt};
+
     let active = manager.list_active_sessions().await;
     if active.is_empty() {
         println!("No active sessions to stop");
         return;
     }
 
-    println!("Stopping {} active session(s)...", active.len());
-    for session_id in active {
-        print!("  Stopping {}: ", session_id);
-        let _ = io::stdout().flush(); // Ignore flush errors
-        match manager.stop_session(&session_id).await {
+    println!("Stopping {} active session(s) in parallel...", active.len());
+
+    // Останавливаем все сессии параллельно (макс 10 одновременно)
+    let results: Vec<_> = stream::iter(active)
+        .map(|session_id| async move {
+            let result = manager.stop_session(&session_id).await;
+            (session_id, result)
+        })
+        .buffer_unordered(10) // Максимум 10 параллельных shutdown
+        .collect()
+        .await;
+
+    // Выводим результаты
+    for (session_id, result) in results {
+        print!("  Stopped {}: ", session_id);
+        match result {
             Ok(()) => println!("✓"),
             Err(e) => println!("✗ Error: {}", e),
         }
     }
+
     println!("✓ All sessions stopped. Goodbye!");
 }
 

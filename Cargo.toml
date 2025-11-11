@@ -8,7 +8,7 @@ opt-level = "z"     # Optimize for size
 lto = true          # Enable Link Time Optimization
 codegen-units = 1   # Better optimization
 strip = true        # Strip symbols from binary
-panic = "abort"     # Smaller panic handler
+# panic = "abort" removed - need unwinding for Drop destructors and catch_unwind
 
 [features]
 default = ["proxy"]
@@ -42,3 +42,6 @@ dashmap = "5.5"
 
 # Date and time
 chrono = "0.4"
+
+# Async utilities for parallel operations
+futures = "0.3"

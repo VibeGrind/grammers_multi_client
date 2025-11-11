@@ -94,6 +94,20 @@ impl ManagerConfig {
         if self.update_queue_limit == 0 {
             return Err("update_queue_limit must be > 0".to_string());
         }
+        if self.update_queue_limit > 10000 {
+            return Err(
+                "update_queue_limit too large (max 10000), would consume excessive memory"
+                    .to_string(),
+            );
+        }
+
+        // Max concurrent sessions validation
+        if self.max_concurrent_sessions > 1000 {
+            return Err(
+                "max_concurrent_sessions too large (max 1000), would exhaust system resources"
+                    .to_string(),
+            );
+        }
 
         // Database path validation
         if self.database_path.as_os_str().is_empty() {
