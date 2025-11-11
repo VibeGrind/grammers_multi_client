@@ -1,156 +1,95 @@
 mod phoenix_bridge;
+mod error;
+mod config;
+mod storage;
+mod domain;
 
 use std::sync::Arc;
 use grammers_client::{Client, Update};
 use grammers_mtsender::SenderPool;
 use grammers_session::storages::SqliteSession;
-use sqlite::Connection;
 use phoenix_bridge::{PhoenixBridge, TelegramUpdate, UserInfo};
-
-const SESSION_FILE: &str = "session/my.session";
-
-// Phoenix Channel configuration (from environment variables)
-const PHOENIX_URL_ENV: &str = "PHOENIX_URL";
-const PHOENIX_TOPIC_ENV: &str = "PHOENIX_TOPIC";
-const DEFAULT_PHOENIX_URL: &str = "ws://localhost:4000/socket";
-const DEFAULT_PHOENIX_TOPIC: &str = "telegram:updates";
-
-// Структура для хранения данных из body таблицы
-struct SessionData {
-    app_id: i32,
-    device: String,
-    sdk: String,
-    app_version: String,
-    lang_code: String,
-    system_lang_code: String,
-    proxy: Option<String>,
-}
-
-fn load_session_data(session_path: &str) -> Result<SessionData, Box<dyn std::error::Error + Send + Sync>> {
-    use sqlite::State;
-
-    let conn = Connection::open(session_path)?;
-
-    // ВАЖНО: Устанавливаем user_version = 1 для существующей grammers сессии
-    // Это предотвращает повторное создание таблиц при SqliteSession::open()
-    conn.execute("PRAGMA user_version = 1")?;
-
-    // Читаем app_id
-    let mut stmt = conn.prepare("SELECT value FROM body WHERE key = 'app_id'")?;
-    let app_id: i32 = if let State::Row = stmt.next()? {
-        stmt.read::<i64, _>(0)? as i32
-    } else {
-        return Err("app_id not found".into());
-    };
-
-    // Читаем остальные поля
-    let device = read_string(&conn, "device")?;
-    let sdk = read_string(&conn, "sdk")?;
-    let app_version = read_string(&conn, "app_version")?;
-    let lang_code = read_string(&conn, "lang_code")?;
-    let system_lang_code = read_string(&conn, "system_lang_code")?;
-
-    // Читаем proxy (опционально) - уже в формате socks5://login:password@ip:port
-    let proxy = read_string(&conn, "proxy").ok().and_then(|proxy_str| {
-        if proxy_str.is_empty() {
-            None
-        } else {
-            Some(proxy_str)
-        }
-    });
-
-    Ok(SessionData {
-        app_id,
-        device,
-        sdk,
-        app_version,
-        lang_code,
-        system_lang_code,
-        proxy,
-    })
-}
-
-fn read_string(conn: &Connection, key: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    use sqlite::State;
-
-    let query = format!("SELECT value FROM body WHERE key = '{}'", key);
-    let mut stmt = conn.prepare(&query)?;
-
-    let value = if let State::Row = stmt.next()? {
-        stmt.read::<String, _>(0)?
-    } else {
-        return Err(format!("{} not found", key).into());
-    };
-
-    // Убираем кавычки из JSON строки
-    let cleaned = value.trim_matches('"').to_string();
-    Ok(cleaned)
-}
+use error::*;
+use config::AppConfig;
+use storage::{SessionRepository, SqliteSessionRepository};
+use domain::{ChatId, MessageId, UserId};
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    // Включаем логи библиотеки
+    // Load and validate configuration from environment variables
+    let app_config = AppConfig::from_env();
+    app_config.validate()?;
+
+    // Initialize logger with config values
     simple_logger::SimpleLogger::new()
-        .with_level(log::LevelFilter::Info)
-        .with_module_level("grammers", log::LevelFilter::Debug)
+        .with_level(app_config.log.level_filter())
+        .with_module_level("grammers", app_config.log.grammers_level_filter())
         .init()
-        .unwrap();
+        .expect("Failed to initialize logger - another logger may already be initialized");
 
     log::info!("=== Telegram Session Client ===");
-    log::info!("Loading session: {}", SESSION_FILE);
+    if log::log_enabled!(log::Level::Info) {
+        log::info!("Loading session: {}", app_config.session.session_file);
+    }
 
-    // Читаем данные из body таблицы (блокирующая операция в spawn_blocking)
-    let session_file = SESSION_FILE.to_string();
+    // Load session data using the storage repository (blocking operation in spawn_blocking)
+    let session_file = app_config.session.session_file.clone();
     let session_data = tokio::task::spawn_blocking(move || {
-        load_session_data(&session_file)
+        let repository = SqliteSessionRepository::new(session_file);
+        repository.load_session_data()
     })
     .await
-    .map_err(|e| format!("Join error: {}", e))?
-    .map_err(|e| format!("Session load error: {}", e))?;
-    log::info!("Device fingerprint loaded:");
-    log::info!("  Device: {}", session_data.device);
-    log::info!("  SDK: {}", session_data.sdk);
-    log::info!("  App version: {}", session_data.app_version);
-    log::info!("  API ID: {}", session_data.app_id);
-    log::info!("  Lang code: {}", session_data.lang_code);
-    log::info!("  System lang code: {}", session_data.system_lang_code);
-    if let Some(ref proxy) = session_data.proxy {
-        log::info!("  Proxy: {} (SOCKS5)", proxy.split('@').nth(1).unwrap_or("***"));
-    } else {
-        log::info!("  Proxy: None (direct connection)");
+    .map_err(|e| SessionError::TaskJoinError(e.to_string()))?
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    if log::log_enabled!(log::Level::Info) {
+        log::info!("Device fingerprint loaded:");
+        log::info!("  Device: {}", session_data.device_info.device_model);
+        log::info!("  SDK: {}", session_data.device_info.sdk);
+        log::info!("  App version: {}", session_data.device_info.app_version);
+        log::info!("  API ID: {}", session_data.app_id);
+        log::info!("  Lang code: {}", session_data.device_info.lang_code);
+        log::info!("  System lang code: {}", session_data.device_info.system_lang_code);
+        if session_data.proxy.is_some() {
+            log::info!("  Proxy: REDACTED (SOCKS5)");
+        } else {
+            log::info!("  Proxy: None (direct connection)");
+        }
     }
 
     // Открываем сессию
-    let session = Arc::new(SqliteSession::open(SESSION_FILE)?);
+    let session = Arc::new(SqliteSession::open(&app_config.session.session_file)?);
 
-    // Создаём ConnectionParams со всеми параметрами из сессии
+    // Create ConnectionParams with all parameters from session
     use grammers_mtsender::ConnectionParams;
 
     let connection_params = ConnectionParams {
-        device_model: session_data.device.clone(),
-        system_version: session_data.sdk.clone(),
-        app_version: session_data.app_version.clone(),
-        system_lang_code: session_data.system_lang_code.clone(),
-        lang_code: session_data.lang_code.clone(),
+        device_model: session_data.device_info.device_model.clone(),
+        system_version: session_data.device_info.sdk.clone(),
+        app_version: session_data.device_info.app_version.clone(),
+        system_lang_code: session_data.device_info.system_lang_code.clone(),
+        lang_code: session_data.device_info.lang_code.clone(),
         #[cfg(feature = "proxy")]
-        proxy_url: session_data.proxy.clone(),
+        proxy_url: session_data.proxy.as_ref().map(|p| p.as_str().to_string()),
         __non_exhaustive: (),
     };
 
-    log::info!("=== Connection Parameters ===");
-    log::info!("  Device Model: {}", connection_params.device_model);
-    log::info!("  System Version: {}", connection_params.system_version);
-    log::info!("  App Version: {}", connection_params.app_version);
-    log::info!("  Lang Code: {}", connection_params.lang_code);
-    log::info!("  System Lang Code: {}", connection_params.system_lang_code);
-    #[cfg(feature = "proxy")]
-    if let Some(ref proxy) = connection_params.proxy_url {
-        log::info!("  Proxy URL: {}", proxy.split('@').nth(1).unwrap_or("***"));
+    if log::log_enabled!(log::Level::Info) {
+        log::info!("=== Connection Parameters ===");
+        log::info!("  Device Model: {}", connection_params.device_model);
+        log::info!("  System Version: {}", connection_params.system_version);
+        log::info!("  App Version: {}", connection_params.app_version);
+        log::info!("  Lang Code: {}", connection_params.lang_code);
+        log::info!("  System Lang Code: {}", connection_params.system_lang_code);
+        #[cfg(feature = "proxy")]
+        if connection_params.proxy_url.is_some() {
+            log::info!("  Proxy URL: REDACTED");
+        }
     }
 
     // Создаём pool с конфигурацией
     let pool = SenderPool::with_configuration(
         Arc::clone(&session),
-        session_data.app_id,
+        session_data.app_id.as_i32(),
         connection_params,
     );
     let client = Client::new(&pool);
@@ -163,75 +102,125 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Проверяем авторизацию
     log::info!("Checking authorization...");
-    match client.is_authorized().await {
-        Ok(true) => {
+    let auth_result = tokio::time::timeout(
+        app_config.telegram.auth_timeout(),
+        client.is_authorized()
+    ).await;
+
+    match auth_result {
+        Ok(Ok(true)) => {
             log::info!("✓ Session is authorized");
             println!("✓ Connected to Telegram");
         }
-        Ok(false) => {
+        Ok(Ok(false)) => {
             log::error!("✗ Session is NOT authorized");
             eprintln!("✗ Session not authorized!");
             handle.quit();
-            let _ = pool_task.await;
+            if let Err(e) = pool_task.await {
+                log::error!("Pool task panicked during shutdown: {:?}", e);
+            }
             return Err("Session not authorized".into());
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             log::error!("Authorization check failed: {:?}", e);
             handle.quit();
-            let _ = pool_task.await;
+            if let Err(e) = pool_task.await {
+                log::error!("Pool task panicked during shutdown: {:?}", e);
+            }
             return Err(format!("Authorization check failed: {}", e).into());
+        }
+        Err(_) => {
+            if log::log_enabled!(log::Level::Error) {
+                log::error!("Authorization check timed out after {} seconds", app_config.telegram.auth_timeout_secs);
+            }
+            handle.quit();
+            if let Err(e) = pool_task.await {
+                log::error!("Pool task panicked during shutdown: {:?}", e);
+            }
+            return Err("Authorization check timed out".into());
         }
     }
 
     // Получаем информацию о себе
-    match client.get_me().await {
-        Ok(user) => {
+    let get_me_result = tokio::time::timeout(
+        app_config.telegram.get_me_timeout(),
+        client.get_me()
+    ).await;
+
+    match get_me_result {
+        Ok(Ok(user)) => {
             let name = user.first_name().unwrap_or("Unknown");
             let id = user.raw.id();
-            log::info!("✓ Logged in as: {} (ID: {})", name, id);
+            if log::log_enabled!(log::Level::Info) {
+                log::info!("✓ Logged in as: {} (ID: {})", name, id);
+            }
             println!("✓ Logged in as: {} (ID: {})", name, id);
         }
-        Err(e) => {
-            log::warn!("Could not get user info: {:?}", e);
+        Ok(Err(e)) => {
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("Could not get user info: {:?}", e);
+            }
+        }
+        Err(_) => {
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("get_me() timed out after {} seconds", app_config.telegram.get_me_timeout_secs);
+            }
         }
     }
 
     // Инициализация Phoenix Channel
-    let phoenix_url = std::env::var(PHOENIX_URL_ENV)
-        .unwrap_or_else(|_| DEFAULT_PHOENIX_URL.to_string());
-    let phoenix_topic = std::env::var(PHOENIX_TOPIC_ENV)
-        .unwrap_or_else(|_| DEFAULT_PHOENIX_TOPIC.to_string());
+    if log::log_enabled!(log::Level::Info) {
+        log::info!("=== Phoenix Channel Integration ===");
+        log::info!("  URL: {}", app_config.phoenix.url);
+        log::info!("  Topic: {}", app_config.phoenix.topic);
+    }
 
-    log::info!("=== Phoenix Channel Integration ===");
-    log::info!("  URL: {}", phoenix_url);
-    log::info!("  Topic: {}", phoenix_topic);
+    let phoenix_result = tokio::time::timeout(
+        app_config.phoenix.connection_timeout(),
+        PhoenixBridge::new(&app_config.phoenix.url, &app_config.phoenix.topic)
+    ).await;
 
-    let phoenix = match PhoenixBridge::new(&phoenix_url, &phoenix_topic).await {
-        Ok(bridge) => {
+    let phoenix = match phoenix_result {
+        Ok(Ok(bridge)) => {
             log::info!("✓ Connected to Phoenix Channel");
             println!("✓ Connected to Phoenix Channel");
             Some(bridge)
         }
-        Err(e) => {
-            log::warn!("⚠ Failed to connect to Phoenix: {:?}", e);
-            log::warn!("  Continuing without Phoenix integration");
+        Ok(Err(e)) => {
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("⚠ Failed to connect to Phoenix: {:?}", e);
+                log::warn!("  Continuing without Phoenix integration");
+            }
             println!("⚠ Phoenix connection failed - continuing in fallback mode");
+            None
+        }
+        Err(_) => {
+            if log::log_enabled!(log::Level::Warn) {
+                log::warn!("⚠ Phoenix connection timed out after {} seconds", app_config.phoenix.connection_timeout_secs);
+                log::warn!("  Continuing without Phoenix integration");
+            }
+            println!("⚠ Phoenix connection timed out - continuing in fallback mode");
             None
         }
     };
 
-    // Настройка для получения обновлений (минимальный буфер для экономии памяти)
+    // Настройка для получения обновлений - use config values
     log::info!("Starting update stream...");
     use grammers_client::UpdatesConfiguration;
-    let config = UpdatesConfiguration {
-        catch_up: true,
-        update_queue_limit: Some(10),  // Уменьшено с 100 до 10 для экономии памяти
+    let updates_config = UpdatesConfiguration {
+        catch_up: app_config.telegram.catch_up,
+        update_queue_limit: app_config.telegram.update_queue_limit,
     };
-    let mut updates_stream = client.stream_updates(updates, config);
+    let mut updates_stream = client.stream_updates(updates, updates_config);
     log::info!("✓ Now online, listening for updates...");
     println!("✓ Online - Press Ctrl+C to stop\n");
 
-    // Основной цикл - строго асинхронная обработка с прямой отправкой в Phoenix
+    // Buffer for batching Phoenix updates
+    let mut update_batch: Vec<TelegramUpdate> = Vec::with_capacity(10);
+    let batch_interval = tokio::time::interval(std::time::Duration::from_millis(100));
+    tokio::pin!(batch_interval);
+
+    // Основной цикл - batch processing for Phoenix
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
@@ -240,94 +229,211 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 break;
             }
 
-            update = updates_stream.next() => {
-                match update {
-                    Ok(update) => {
-                        // Создаём TelegramUpdate для отправки в Phoenix
+            _ = batch_interval.tick() => {
+                // Send batched updates to Phoenix
+                if !update_batch.is_empty() && phoenix.is_some() {
+                    let batch_to_send = std::mem::replace(&mut update_batch, Vec::with_capacity(10));
+                    let phoenix_ref = phoenix.as_ref().unwrap();
+
+                    // Spawn task to send batch without blocking
+                    let phoenix_clone = phoenix_ref.clone();
+                    let send_timeout = app_config.phoenix.send_timeout();
+                    tokio::spawn(async move {
+                        for telegram_update in batch_to_send {
+                            let send_result = tokio::time::timeout(
+                                send_timeout,
+                                phoenix_clone.send_update(telegram_update)
+                            ).await;
+
+                            if send_result.is_err() && log::log_enabled!(log::Level::Warn) {
+                                log::warn!("Phoenix send_update timed out");
+                            }
+                        }
+                    });
+                }
+            }
+
+            update_result = tokio::time::timeout(
+                app_config.telegram.update_stream_timeout(),
+                updates_stream.next()
+            ) => {
+                match update_result {
+                    Err(_) => {
+                        if log::log_enabled!(log::Level::Warn) {
+                            log::warn!("Update stream timed out after {} seconds", app_config.telegram.update_stream_timeout_secs);
+                        }
+                        continue;
+                    }
+                    Ok(Ok(update)) => {
+                        // Process update with minimal allocations
                         let telegram_update = match &update {
                             Update::NewMessage(msg) => {
                                 let text = msg.text();
-                                let chat_id = msg.peer_id().bot_api_dialog_id();
-                                let message_id = msg.id();
-                                let peer = msg.peer().ok().and_then(|p| p.name()).unwrap_or_default();
+                                let chat_id_raw = msg.peer_id().bot_api_dialog_id();
+                                let message_id_raw = msg.id();
 
-                                log::info!("New message from {}: {}", peer, text);
+                                if log::log_enabled!(log::Level::Info) {
+                                    let peer_name = msg.peer().ok().and_then(|p| p.name()).unwrap_or("");
+                                    log::info!("New message from {}: {}", peer_name, text);
+                                }
 
-                                Some(TelegramUpdate {
-                                    update_type: "new_message".to_string(),
-                                    chat_id: Some(chat_id),
-                                    message_id: Some(message_id),
-                                    text: Some(text.to_string()),
-                                    from_user: msg.sender().map(|sender_peer| UserInfo {
-                                        id: sender_peer.id().bot_api_dialog_id(),
-                                        first_name: sender_peer.name().unwrap_or("").to_string(),
-                                        username: sender_peer.username().map(String::from),
-                                    }),
-                                    timestamp: Some(msg.date().timestamp()),
-                                    raw_data: None,
-                                })
+                                // Validate and wrap IDs using domain types
+                                let chat_id = ChatId::new(chat_id_raw).ok();
+                                let message_id = MessageId::new(message_id_raw).ok();
+
+                                let from_user = msg.sender().and_then(|sender_peer| {
+                                    let user_id_raw = sender_peer.id().bot_api_dialog_id();
+                                    UserId::new(user_id_raw).ok().map(|user_id| {
+                                        // Minimize allocations - only allocate when necessary
+                                        let name = sender_peer.name().unwrap_or("");
+                                        let username = sender_peer.username();
+                                        domain::UserInfo::new(
+                                            user_id,
+                                            name.to_string(),
+                                            username.map(str::to_string),
+                                        )
+                                    })
+                                });
+
+                                // Create update using domain constructor
+                                chat_id.and_then(|cid| message_id.map(|mid| {
+                                    TelegramUpdate::new_message(
+                                        cid,
+                                        mid,
+                                        text.to_string(),  // Only allocation needed for serialization
+                                        from_user,
+                                        msg.date().timestamp(),
+                                    )
+                                }))
                             }
                             Update::MessageEdited(msg) => {
-                                log::debug!("Message edited: {}", msg.text());
-                                Some(TelegramUpdate {
-                                    update_type: "message_edited".to_string(),
-                                    chat_id: Some(msg.peer_id().bot_api_dialog_id()),
-                                    message_id: Some(msg.id()),
-                                    text: Some(msg.text().to_string()),
-                                    from_user: None,
-                                    timestamp: Some(msg.date().timestamp()),
-                                    raw_data: None,
-                                })
+                                if log::log_enabled!(log::Level::Debug) {
+                                    log::debug!("Message edited: {}", msg.text());
+                                }
+
+                                let chat_id_raw = msg.peer_id().bot_api_dialog_id();
+                                let message_id_raw = msg.id();
+
+                                // Validate and wrap IDs using domain types
+                                let chat_id = ChatId::new(chat_id_raw).ok();
+                                let message_id = MessageId::new(message_id_raw).ok();
+
+                                // Create update using domain constructor
+                                chat_id.and_then(|cid| message_id.map(|mid| {
+                                    TelegramUpdate::message_edited(
+                                        cid,
+                                        mid,
+                                        msg.text().to_string(),
+                                        msg.date().timestamp(),
+                                    )
+                                }))
                             }
                             Update::MessageDeleted(deleted) => {
-                                let chat_id = deleted.channel_id();
-                                log::debug!("Message deleted: channel_id={:?}, messages={:?}", chat_id, deleted.messages());
-                                Some(TelegramUpdate {
-                                    update_type: "message_deleted".to_string(),
+                                if log::log_enabled!(log::Level::Debug) {
+                                    let chat_id_raw = deleted.channel_id();
+                                    let messages = deleted.messages();
+                                    log::debug!("Message deleted: channel_id={:?}, messages={:?}", chat_id_raw, messages);
+                                }
+
+                                let chat_id_raw = deleted.channel_id();
+                                let first_msg = deleted.messages().first().copied();
+
+                                // Validate and wrap IDs (both are optional for delete)
+                                let chat_id = chat_id_raw.and_then(|id| ChatId::new(id).ok());
+                                let message_id = first_msg.and_then(|id| MessageId::new(id).ok());
+
+                                // Only format when necessary
+                                let raw_data = if log::log_enabled!(log::Level::Debug) {
+                                    format!("deleted_messages: {:?}", deleted.messages())
+                                } else {
+                                    String::from("deleted")
+                                };
+
+                                // Create update using domain constructor
+                                Some(TelegramUpdate::message_deleted(
                                     chat_id,
-                                    message_id: deleted.messages().first().copied(),
-                                    text: None,
-                                    from_user: None,
-                                    timestamp: None,
-                                    raw_data: Some(format!("deleted_messages: {:?}", deleted.messages())),
-                                })
+                                    message_id,
+                                    raw_data,
+                                ))
                             }
                             _ => {
-                                log::debug!("Other update: {:?}", update);
-                                Some(TelegramUpdate {
-                                    update_type: "other".to_string(),
-                                    chat_id: None,
-                                    message_id: None,
-                                    text: None,
-                                    from_user: None,
-                                    timestamp: None,
-                                    raw_data: Some(format!("{:?}", update)),
-                                })
+                                if log::log_enabled!(log::Level::Debug) {
+                                    log::debug!("Other update: {:?}", update);
+                                }
+                                // Only format debug info when debug logging is enabled
+                                let raw_data = if log::log_enabled!(log::Level::Debug) {
+                                    format!("{:?}", update)
+                                } else {
+                                    String::from("other")
+                                };
+                                Some(TelegramUpdate::other(raw_data))
                             }
                         };
 
-                        // Прямая отправка в Phoenix без буферизации (fire-and-forget)
-                        if let (Some(phoenix), Some(telegram_update)) = (&phoenix, telegram_update) {
-                            phoenix.send_update(telegram_update).await;
+                        // Add to batch instead of sending immediately
+                        if let Some(telegram_update) = telegram_update {
+                            update_batch.push(telegram_update);
+
+                            // If batch is large enough, send immediately
+                            if update_batch.len() >= 10 && phoenix.is_some() {
+                                let batch_to_send = std::mem::replace(&mut update_batch, Vec::with_capacity(10));
+                                let phoenix_ref = phoenix.as_ref().unwrap();
+                                let phoenix_clone = phoenix_ref.clone();
+                                let send_timeout = app_config.phoenix.send_timeout();
+
+                                tokio::spawn(async move {
+                                    for telegram_update in batch_to_send {
+                                        let send_result = tokio::time::timeout(
+                                            send_timeout,
+                                            phoenix_clone.send_update(telegram_update)
+                                        ).await;
+
+                                        if send_result.is_err() && log::log_enabled!(log::Level::Warn) {
+                                            log::warn!("Phoenix send_update timed out");
+                                        }
+                                    }
+                                });
+                            }
                         }
                     }
-                    Err(e) => {
-                        log::error!("Update error: {:?}", e);
+                    Ok(Err(e)) => {
+                        if log::log_enabled!(log::Level::Error) {
+                            log::error!("Update error: {:?}", e);
+                        }
                     }
                 }
             }
         }
     }
 
+    // Send any remaining batched updates before shutdown
+    if !update_batch.is_empty() && phoenix.is_some() {
+        let phoenix_ref = phoenix.as_ref().unwrap();
+        for telegram_update in update_batch {
+            let send_result = tokio::time::timeout(
+                app_config.phoenix.send_timeout(),
+                phoenix_ref.send_update(telegram_update)
+            ).await;
+
+            if send_result.is_err() && log::log_enabled!(log::Level::Warn) {
+                log::warn!("Phoenix send_update timed out during shutdown");
+            }
+        }
+    }
+
     // Graceful shutdown
     log::info!("Syncing state...");
-    updates_stream.sync_update_state();
+    if let Err(e) = updates_stream.sync_update_state() {
+        log::error!("Failed to sync update state: {:?}", e);
+    }
 
     log::info!("Stopping connections...");
     handle.quit();
 
     log::info!("Waiting for pool to stop...");
-    let _ = pool_task.await;
+    if let Err(e) = pool_task.await {
+        log::error!("Pool task panicked during shutdown: {:?}", e);
+    }
 
     log::info!("✓ Shutdown complete");
     println!("✓ Disconnected");
@@ -335,7 +441,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     if let Err(e) = run().await {
         eprintln!("Fatal error: {}", e);

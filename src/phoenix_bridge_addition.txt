@@ -1,0 +1,23 @@
+
+    /// Sends a batch of updates efficiently
+    /// This is optimized for sending multiple updates at once
+    pub async fn send_batch(&self, updates: Vec<TelegramUpdate>) {
+        if updates.is_empty() {
+            return;
+        }
+
+        for update in updates {
+            self.send_update(update).await;
+        }
+    }
+
+    /// Sends a batch of updates with retry logic
+    pub async fn send_batch_with_retry(&self, updates: Vec<TelegramUpdate>) {
+        if updates.is_empty() {
+            return;
+        }
+
+        for update in updates {
+            self.send_with_retry(update).await;
+        }
+    }
