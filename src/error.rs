@@ -162,7 +162,7 @@ impl From<Box<dyn std::error::Error + Send + Sync>> for TelegramError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{DomainError, ApiId};
+    use crate::domain::DomainError;
 
     // ============================================================================
     // SessionError Tests

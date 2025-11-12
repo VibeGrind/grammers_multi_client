@@ -1,5 +1,5 @@
 use crate::error::SessionError;
-use crate::domain::{SessionData as DomainSessionData, ApiId, ProxyUrl};
+use crate::domain::{ApiId, ProxyUrl};
 use sqlite::Connection;
 use std::path::Path;
 use std::fs::{File, OpenOptions};
@@ -426,7 +426,7 @@ mod tests {
     // SqliteSessionRepository Tests
     #[test]
     fn test_sqlite_repository_new() {
-        let repo = SqliteSessionRepository::new("test.db");
+        let _repo = SqliteSessionRepository::new("test.db");
         // Verify it's created without panic
         assert!(true);
     }
@@ -504,9 +504,12 @@ mod tests {
     /// without requiring actual database files
     #[derive(Clone)]
     struct MockSessionRepository {
-        app_id: Option<Result<ApiId, SessionError>>,
-        device_info: Option<Result<DeviceInfo, SessionError>>,
-        proxy_url: Option<Result<Option<ProxyUrl>, SessionError>>,
+        app_id: Option<ApiId>,
+        device_info: Option<DeviceInfo>,
+        proxy_url: Option<Option<ProxyUrl>>,
+        should_fail_app_id: bool,
+        should_fail_device_info: bool,
+        should_fail_proxy_url: bool,
     }
 
     impl MockSessionRepository {
@@ -515,21 +518,40 @@ mod tests {
                 app_id: None,
                 device_info: None,
                 proxy_url: None,
+                should_fail_app_id: false,
+                should_fail_device_info: false,
+                should_fail_proxy_url: false,
             }
         }
 
-        fn with_app_id(mut self, result: Result<ApiId, SessionError>) -> Self {
-            self.app_id = Some(result);
+        fn with_app_id(mut self, app_id: ApiId) -> Self {
+            self.app_id = Some(app_id);
             self
         }
 
-        fn with_device_info(mut self, result: Result<DeviceInfo, SessionError>) -> Self {
-            self.device_info = Some(result);
+        #[allow(dead_code)]
+        fn with_device_info(mut self, device_info: DeviceInfo) -> Self {
+            self.device_info = Some(device_info);
             self
         }
 
-        fn with_proxy_url(mut self, result: Result<Option<ProxyUrl>, SessionError>) -> Self {
-            self.proxy_url = Some(result);
+        fn with_proxy_url(mut self, proxy_url: Option<ProxyUrl>) -> Self {
+            self.proxy_url = Some(proxy_url);
+            self
+        }
+
+        fn with_app_id_error(mut self) -> Self {
+            self.should_fail_app_id = true;
+            self
+        }
+
+        fn with_device_info_error(mut self) -> Self {
+            self.should_fail_device_info = true;
+            self
+        }
+
+        fn with_proxy_url_error(mut self) -> Self {
+            self.should_fail_proxy_url = true;
             self
         }
     }
@@ -548,25 +570,40 @@ mod tests {
         }
 
         fn get_api_id(&self) -> Result<ApiId, SessionError> {
-            self.app_id.clone().unwrap_or_else(|| {
-                ApiId::new(12345).map_err(|e| SessionError::Domain(e))
-            })
+            if self.should_fail_app_id {
+                return Err(SessionError::FieldNotFound {
+                    field: "app_id".to_string(),
+                });
+            }
+            Ok(self.app_id.unwrap_or_else(|| {
+                ApiId::new(12345).unwrap()
+            }))
         }
 
         fn get_device_info(&self) -> Result<DeviceInfo, SessionError> {
-            self.device_info.clone().unwrap_or_else(|| {
-                Ok(DeviceInfo {
+            if self.should_fail_device_info {
+                return Err(SessionError::FieldNotFound {
+                    field: "device".to_string(),
+                });
+            }
+            Ok(self.device_info.clone().unwrap_or_else(|| {
+                DeviceInfo {
                     device_model: "Test Device".to_string(),
                     sdk: "Test SDK".to_string(),
                     app_version: "1.0.0".to_string(),
                     lang_code: "en".to_string(),
                     system_lang_code: "en-US".to_string(),
-                })
-            })
+                }
+            }))
         }
 
         fn get_proxy_url(&self) -> Result<Option<ProxyUrl>, SessionError> {
-            self.proxy_url.clone().unwrap_or(Ok(None))
+            if self.should_fail_proxy_url {
+                return Err(SessionError::InvalidProxyUrl {
+                    reason: "Invalid format".to_string(),
+                });
+            }
+            Ok(self.proxy_url.clone().unwrap_or(None))
         }
     }
 
@@ -583,18 +620,19 @@ mod tests {
 
     #[test]
     fn test_mock_repository_with_custom_api_id() {
+        let api_id = ApiId::new(99999).unwrap();
         let mock = MockSessionRepository::new()
-            .with_app_id(ApiId::new(99999).map_err(|e| SessionError::Domain(e)));
+            .with_app_id(api_id);
 
-        let api_id = mock.get_api_id().unwrap();
-        assert_eq!(api_id.as_i32(), 99999);
+        let result_api_id = mock.get_api_id().unwrap();
+        assert_eq!(result_api_id.as_i32(), 99999);
     }
 
     #[test]
     fn test_mock_repository_with_proxy() {
         let proxy = ProxyUrl::new("socks5://proxy.com:1080".to_string()).unwrap();
         let mock = MockSessionRepository::new()
-            .with_proxy_url(Ok(Some(proxy.clone())));
+            .with_proxy_url(Some(proxy.clone()));
 
         let proxy_result = mock.get_proxy_url().unwrap();
         assert!(proxy_result.is_some());
@@ -603,9 +641,7 @@ mod tests {
     #[test]
     fn test_mock_repository_error_propagation() {
         let mock = MockSessionRepository::new()
-            .with_app_id(Err(SessionError::FieldNotFound {
-                field: "app_id".to_string(),
-            }));
+            .with_app_id_error();
 
         let result = mock.load_session_data();
         assert!(result.is_err());
@@ -615,9 +651,7 @@ mod tests {
     #[test]
     fn test_mock_repository_device_info_error() {
         let mock = MockSessionRepository::new()
-            .with_device_info(Err(SessionError::FieldNotFound {
-                field: "device".to_string(),
-            }));
+            .with_device_info_error();
 
         let result = mock.get_device_info();
         assert!(result.is_err());
@@ -626,9 +660,7 @@ mod tests {
     #[test]
     fn test_mock_repository_proxy_error() {
         let mock = MockSessionRepository::new()
-            .with_proxy_url(Err(SessionError::InvalidProxyUrl {
-                reason: "Invalid format".to_string(),
-            }));
+            .with_proxy_url_error();
 
         let result = mock.get_proxy_url();
         assert!(result.is_err());

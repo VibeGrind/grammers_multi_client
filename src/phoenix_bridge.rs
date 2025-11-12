@@ -94,20 +94,23 @@ pub struct PhoenixBridge {
 
 impl PhoenixBridge {
     /// Creates a new PhoenixBridge with retry logic and exponential backoff
-    pub async fn new(url: &str, topic: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_config(url, topic, RetryConfig::default()).await
+    pub async fn new(url: &str, topic: &str, auth_token: Option<&str>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::new_with_config(url, topic, auth_token, RetryConfig::default()).await
     }
 
     /// Creates a new PhoenixBridge with custom retry configuration
     pub async fn new_with_config(
         url: &str,
         topic: &str,
+        auth_token: Option<&str>,
         retry_config: RetryConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use phoenix_channels_client::{Client as PhxClient, Config};
+        use serde_json::json;
 
         let url_owned = url.to_string();
         let topic_owned = topic.to_string();
+        let auth_token_owned = auth_token.map(|t| t.to_string());
 
         // Connect to Phoenix with retry logic
         let channel = retry_with_backoff(
@@ -126,14 +129,29 @@ impl PhoenixBridge {
                 })??;
 
                 log::info!("Joining channel: {}", topic_owned);
-                // Join with 30 second outer timeout (has 10 second inner timeout)
-                let channel = tokio::time::timeout(
-                    Duration::from_secs(30),
-                    client.join(&topic_owned, Some(Duration::from_secs(10)))
-                ).await
-                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                    "Phoenix channel join timed out after 30 seconds".into()
-                })??;
+
+                // Prepare join parameters with authentication token if provided
+                let channel = if let Some(ref token) = auth_token_owned {
+                    log::info!("Authenticating with Phoenix channel using provided token");
+                    let params = json!({ "token": token });
+                    // Join with auth token and 30 second timeout
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        client.join_with_params(&topic_owned, params, Some(Duration::from_secs(10)))
+                    ).await
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "Phoenix channel join with auth timed out after 30 seconds".into()
+                    })??
+                } else {
+                    // Join without auth token
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        client.join(&topic_owned, Some(Duration::from_secs(10)))
+                    ).await
+                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                        "Phoenix channel join timed out after 30 seconds".into()
+                    })??
+                };
 
                 log::info!("Successfully joined Phoenix channel");
 
@@ -597,6 +615,7 @@ mod tests {
         let result = PhoenixBridge::new_with_config(
             "ws://localhost:4000/socket",
             "test:topic",
+            None,  // No auth token for test
             config,
         )
         .await;
@@ -621,6 +640,7 @@ mod tests {
         let bridge = PhoenixBridge::new_with_config(
             "ws://localhost:4000/socket",
             "test:topic",
+            None,  // No auth token for test
             config,
         )
         .await;
@@ -656,6 +676,7 @@ mod tests {
         let bridge = PhoenixBridge::new_with_config(
             "ws://localhost:4000/socket",
             "test:topic",
+            None,  // No auth token for test
             config,
         )
         .await;
