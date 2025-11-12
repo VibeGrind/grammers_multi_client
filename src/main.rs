@@ -266,7 +266,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Ok(Ok(update)) => {
                         // Process update with minimal allocations
-                        let telegram_update = match &update {
+                        // MessageDeleted is special - it can generate multiple updates
+                        match &update {
                             Update::NewMessage(msg) => {
                                 let text = msg.text();
                                 let chat_id_raw = msg.peer_id().bot_api_dialog_id();
@@ -296,7 +297,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 });
 
                                 // Create update using domain constructor
-                                chat_id.and_then(|cid| message_id.map(|mid| {
+                                if let Some(telegram_update) = chat_id.and_then(|cid| message_id.map(|mid| {
                                     TelegramUpdate::new_message(
                                         cid,
                                         mid,
@@ -304,7 +305,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                         from_user,
                                         msg.date().timestamp(),
                                     )
-                                }))
+                                })) {
+                                    update_batch.push(telegram_update);
+                                }
                             }
                             Update::MessageEdited(msg) => {
                                 if log::log_enabled!(log::Level::Debug) {
@@ -319,42 +322,50 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 let message_id = MessageId::new(message_id_raw).ok();
 
                                 // Create update using domain constructor
-                                chat_id.and_then(|cid| message_id.map(|mid| {
+                                if let Some(telegram_update) = chat_id.and_then(|cid| message_id.map(|mid| {
                                     TelegramUpdate::message_edited(
                                         cid,
                                         mid,
                                         msg.text().to_string(),
                                         msg.date().timestamp(),
                                     )
-                                }))
+                                })) {
+                                    update_batch.push(telegram_update);
+                                }
                             }
                             Update::MessageDeleted(deleted) => {
+                                // CRITICAL FIX: Process ALL deleted messages, not just the first one
+                                // Previously this was causing data loss by ignoring all but the first message
+                                let chat_id_raw = deleted.channel_id();
+                                let messages = deleted.messages();
+
                                 if log::log_enabled!(log::Level::Debug) {
-                                    let chat_id_raw = deleted.channel_id();
-                                    let messages = deleted.messages();
-                                    log::debug!("Message deleted: channel_id={:?}, messages={:?}", chat_id_raw, messages);
+                                    log::debug!("Message deleted: channel_id={:?}, count={}, messages={:?}",
+                                        chat_id_raw, messages.len(), messages);
                                 }
 
-                                let chat_id_raw = deleted.channel_id();
-                                let first_msg = deleted.messages().first().copied();
-
-                                // Validate and wrap IDs (both are optional for delete)
+                                // Validate chat_id once
                                 let chat_id = chat_id_raw.and_then(|id| ChatId::new(id).ok());
-                                let message_id = first_msg.and_then(|id| MessageId::new(id).ok());
 
-                                // Only format when necessary
-                                let raw_data = if log::log_enabled!(log::Level::Debug) {
-                                    format!("deleted_messages: {:?}", deleted.messages())
-                                } else {
-                                    String::from("deleted")
-                                };
+                                // Process EACH deleted message
+                                for &msg_id in messages {
+                                    if let Some(message_id) = MessageId::new(msg_id).ok() {
+                                        // Only format when necessary
+                                        let raw_data = if log::log_enabled!(log::Level::Debug) {
+                                            format!("deleted message_id={}", msg_id)
+                                        } else {
+                                            String::from("deleted")
+                                        };
 
-                                // Create update using domain constructor
-                                Some(TelegramUpdate::message_deleted(
-                                    chat_id,
-                                    message_id,
-                                    raw_data,
-                                ))
+                                        // Create update using domain constructor
+                                        let telegram_update = TelegramUpdate::message_deleted(
+                                            chat_id,
+                                            Some(message_id),
+                                            raw_data,
+                                        );
+                                        update_batch.push(telegram_update);
+                                    }
+                                }
                             }
                             _ => {
                                 if log::log_enabled!(log::Level::Debug) {
@@ -366,34 +377,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     String::from("other")
                                 };
-                                Some(TelegramUpdate::other(raw_data))
+                                update_batch.push(TelegramUpdate::other(raw_data));
                             }
-                        };
+                        }
 
-                        // Add to batch instead of sending immediately
-                        if let Some(telegram_update) = telegram_update {
-                            update_batch.push(telegram_update);
+                        // Check if batch is large enough to send immediately
+                        if update_batch.len() >= 10 && phoenix.is_some() {
+                            let batch_to_send = std::mem::replace(&mut update_batch, Vec::with_capacity(10));
+                            let phoenix_ref = phoenix.as_ref().unwrap();
+                            let phoenix_clone = phoenix_ref.clone();
+                            let send_timeout = app_config.phoenix.send_timeout();
 
-                            // If batch is large enough, send immediately
-                            if update_batch.len() >= 10 && phoenix.is_some() {
-                                let batch_to_send = std::mem::replace(&mut update_batch, Vec::with_capacity(10));
-                                let phoenix_ref = phoenix.as_ref().unwrap();
-                                let phoenix_clone = phoenix_ref.clone();
-                                let send_timeout = app_config.phoenix.send_timeout();
+                            tokio::spawn(async move {
+                                for telegram_update in batch_to_send {
+                                    let send_result = tokio::time::timeout(
+                                        send_timeout,
+                                        phoenix_clone.send_update(telegram_update)
+                                    ).await;
 
-                                tokio::spawn(async move {
-                                    for telegram_update in batch_to_send {
-                                        let send_result = tokio::time::timeout(
-                                            send_timeout,
-                                            phoenix_clone.send_update(telegram_update)
-                                        ).await;
-
-                                        if send_result.is_err() && log::log_enabled!(log::Level::Warn) {
-                                            log::warn!("Phoenix send_update timed out");
-                                        }
+                                    if send_result.is_err() && log::log_enabled!(log::Level::Warn) {
+                                        log::warn!("Phoenix send_update timed out");
                                     }
-                                });
-                            }
+                                }
+                            });
                         }
                     }
                     Ok(Err(e)) => {

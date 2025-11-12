@@ -106,7 +106,9 @@ impl Default for SessionConfig {
 impl Default for PhoenixConfig {
     fn default() -> Self {
         Self {
-            url: "ws://localhost:4000/socket".to_string(),
+            // SECURITY: Use wss:// (WebSocket Secure) by default instead of ws://
+            // For local development, explicitly set PHOENIX_URL=ws://localhost:4000/socket
+            url: "wss://localhost:4000/socket".to_string(),
             topic: "telegram:updates".to_string(),
             retry: RetryConfig::default(),
             connection_timeout_secs: 30,
@@ -1562,7 +1564,8 @@ mod tests {
     #[test]
     fn test_phoenix_config_defaults() {
         let config = PhoenixConfig::default();
-        assert_eq!(config.url, "ws://localhost:4000/socket");
+        // After security fix: default changed from ws:// to wss://
+        assert_eq!(config.url, "wss://localhost:4000/socket");
         assert_eq!(config.topic, "telegram:updates");
         assert_eq!(config.connection_timeout_secs, 30);
         assert_eq!(config.join_timeout_secs, 30);
@@ -1603,7 +1606,8 @@ mod tests {
         let config = AppConfig::default();
         // Verify all sub-configs are initialized
         assert_eq!(config.session.session_file, "session/my.session");
-        assert_eq!(config.phoenix.url, "ws://localhost:4000/socket");
+        // After security fix: default changed from ws:// to wss://
+        assert_eq!(config.phoenix.url, "wss://localhost:4000/socket");
         assert_eq!(config.telegram.auth_timeout_secs, 30);
         assert_eq!(config.log.level, "info");
     }
