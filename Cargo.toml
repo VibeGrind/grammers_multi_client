@@ -15,10 +15,10 @@ default = ["proxy"]
 proxy = ["grammers-client/proxy", "grammers-mtsender/proxy"]
 
 [dependencies]
-# Grammers - используем local path (к grammers-master в той же директории)
-grammers-client = { path = "../grammers-master/grammers-client", features = ["proxy"] }
-grammers-session = { path = "../grammers-master/grammers-session" }
-grammers-mtsender = { path = "../grammers-master/grammers-mtsender", features = ["proxy"] }
+# Grammers - используем версии из git
+grammers-client = { git = "https://github.com/Lonami/grammers", features = ["proxy"] }
+grammers-session = { git = "https://github.com/Lonami/grammers" }
+grammers-mtsender = { git = "https://github.com/Lonami/grammers", features = ["proxy"] }
 
 # Async runtime (минимальные features)
 tokio = { version = "1", features = ["rt", "macros", "net", "time", "io-util", "sync", "signal"] }
