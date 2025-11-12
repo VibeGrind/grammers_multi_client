@@ -5,14 +5,22 @@
 // 2. send_with_retry() for automatic retry of failed sends
 // 3. Custom RetryConfig for different retry strategies
 
-use phoenix_bridge::{PhoenixBridge, RetryConfig, TelegramUpdate, UserInfo};
+use telegram_minimal_client::domain::{TelegramUpdate, UserInfo};
+// Note: PhoenixBridge is internal and not exported from the library
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize logger
-    simple_logger::SimpleLogger::new().init().unwrap();
+    // NOTE: This example is for documentation purposes only.
+    // PhoenixBridge is now internal and not exported from the library.
+    // The retry logic demonstrated here is integrated into the main application.
 
     println!("=== Phoenix Retry Logic Examples ===\n");
+    println!("Note: PhoenixBridge is internal. See src/main.rs for actual usage.\n");
+
+    /* Example code commented out since PhoenixBridge is internal:
+
+    // Initialize logger
+    simple_logger::SimpleLogger::new().init().unwrap();
 
     // Example 1: Using default retry configuration
     println!("Example 1: Default retry configuration");
@@ -25,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let phoenix_topic = "telegram:updates";
 
     // This will automatically retry connection with exponential backoff
-    let bridge = match PhoenixBridge::new(phoenix_url, phoenix_topic).await {
+    let bridge = match PhoenixBridge::new(phoenix_url, phoenix_topic, None).await {
         Ok(b) => {
             println!("✓ Connected successfully!\n");
             b
@@ -98,5 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
 
     println!("\nDone!");
+    */
+
     Ok(())
 }

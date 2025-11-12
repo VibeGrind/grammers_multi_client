@@ -32,6 +32,7 @@ sqlite = "0.37"
 
 # Phoenix Channel integration
 phoenix_channels_client = "0.1"
+url = "2"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

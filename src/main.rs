@@ -3,6 +3,7 @@ mod error;
 mod config;
 mod storage;
 mod domain;
+mod circuit_breaker;
 
 use std::sync::Arc;
 use grammers_client::{Client, Update};
@@ -175,12 +176,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         log::info!("  Topic: {}", app_config.phoenix.topic);
     }
 
+    // Prepare circuit breaker configuration if enabled
+    let circuit_breaker_config = if app_config.phoenix.enable_circuit_breaker {
+        Some(app_config.phoenix.circuit_breaker_config())
+    } else {
+        None
+    };
+
     let phoenix_result = tokio::time::timeout(
         app_config.phoenix.connection_timeout(),
-        PhoenixBridge::new(
+        phoenix_bridge::PhoenixBridge::new_with_config(
             &app_config.phoenix.url,
             &app_config.phoenix.topic,
-            app_config.phoenix.auth_token.as_deref()
+            app_config.phoenix.auth_token.as_deref(),
+            phoenix_bridge::RetryConfig::default(),
+            circuit_breaker_config
         )
     ).await;
 
@@ -442,9 +452,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     // Graceful shutdown
     log::info!("Syncing state...");
-    if let Err(e) = updates_stream.sync_update_state() {
-        log::error!("Failed to sync update state: {:?}", e);
-    }
+    updates_stream.sync_update_state();
+    log::info!("State synced");
 
     log::info!("Stopping connections...");
     handle.quit();

@@ -127,7 +127,7 @@ fn test_session_data_domain_conversion() {
     let api_id = ApiId::new(12345).unwrap();
     let proxy = ProxyUrl::new("socks5://proxy.example.com:1080".to_string()).unwrap();
 
-    let session_data = crate::domain::SessionData::new(
+    let session_data = telegram_minimal_client::domain::SessionData::new(
         api_id,
         "Android 13".to_string(),
         "SDK 33".to_string(),

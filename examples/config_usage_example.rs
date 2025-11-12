@@ -203,10 +203,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let invalid_config = PhoenixConfig {
         url: "http://invalid.com".to_string(), // Should be ws:// or wss://
         topic: "topic".to_string(),
+        auth_token: None,
         retry: RetryConfig::default(),
         connection_timeout_secs: 30,
         join_timeout_secs: 30,
         send_timeout_secs: 10,
+        enable_circuit_breaker: false,
+        circuit_breaker_failure_threshold: 5,
+        circuit_breaker_success_threshold: 2,
+        circuit_breaker_timeout_secs: 60,
     };
 
     match invalid_config.validate() {

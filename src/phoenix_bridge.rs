@@ -90,23 +90,24 @@ pub struct PhoenixBridge {
     topic: String,
     retry_queue_tx: mpsc::Sender<QueuedUpdate>,
     retry_config: RetryConfig,
+    circuit_breaker: Option<Arc<crate::circuit_breaker::CircuitBreaker>>,
 }
 
 impl PhoenixBridge {
     /// Creates a new PhoenixBridge with retry logic and exponential backoff
     pub async fn new(url: &str, topic: &str, auth_token: Option<&str>) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::new_with_config(url, topic, auth_token, RetryConfig::default()).await
+        Self::new_with_config(url, topic, auth_token, RetryConfig::default(), None).await
     }
 
-    /// Creates a new PhoenixBridge with custom retry configuration
+    /// Creates a new PhoenixBridge with custom retry configuration and optional circuit breaker
     pub async fn new_with_config(
         url: &str,
         topic: &str,
         auth_token: Option<&str>,
         retry_config: RetryConfig,
+        circuit_breaker_config: Option<crate::circuit_breaker::CircuitBreakerConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         use phoenix_channels_client::{Client as PhxClient, Config};
-        use serde_json::json;
 
         let url_owned = url.to_string();
         let topic_owned = topic.to_string();
@@ -116,7 +117,11 @@ impl PhoenixBridge {
         let channel = retry_with_backoff(
             || async {
                 log::info!("Connecting to Phoenix Channel: {}", url_owned);
-                let config = Config::new(&url_owned)?;
+                let url = url::Url::parse(&url_owned)
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("Invalid Phoenix URL: {}", e).into()
+                    })?;
+                let config = Config::new(url)?;
                 let mut client = PhxClient::new(config)?;
 
                 // Connect with 30 second timeout
@@ -130,28 +135,22 @@ impl PhoenixBridge {
 
                 log::info!("Joining channel: {}", topic_owned);
 
-                // Prepare join parameters with authentication token if provided
-                let channel = if let Some(ref token) = auth_token_owned {
-                    log::info!("Authenticating with Phoenix channel using provided token");
-                    let params = json!({ "token": token });
-                    // Join with auth token and 30 second timeout
-                    tokio::time::timeout(
-                        Duration::from_secs(30),
-                        client.join_with_params(&topic_owned, params, Some(Duration::from_secs(10)))
-                    ).await
-                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                        "Phoenix channel join with auth timed out after 30 seconds".into()
-                    })??
-                } else {
-                    // Join without auth token
-                    tokio::time::timeout(
-                        Duration::from_secs(30),
-                        client.join(&topic_owned, Some(Duration::from_secs(10)))
-                    ).await
-                    .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-                        "Phoenix channel join timed out after 30 seconds".into()
-                    })??
-                };
+                // Note: auth_token parameter is currently not used because
+                // phoenix_channels_client doesn't expose join_with_params yet.
+                // Auth would need to be implemented at the Phoenix server level
+                // or we need to use a different client library.
+                if auth_token_owned.is_some() {
+                    log::warn!("Auth token provided but phoenix_channels_client doesn't support join parameters yet");
+                }
+
+                // Join channel with 30 second timeout
+                let channel = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    client.join(&topic_owned, Some(Duration::from_secs(10)))
+                ).await
+                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    "Phoenix channel join timed out after 30 seconds".into()
+                })??;
 
                 log::info!("Successfully joined Phoenix channel");
 
@@ -169,11 +168,18 @@ impl PhoenixBridge {
         log::info!("Creating bounded retry queue with capacity: {}", queue_capacity);
         let (retry_queue_tx, retry_queue_rx) = mpsc::channel(queue_capacity);
 
+        // Initialize circuit breaker if configured
+        let circuit_breaker = circuit_breaker_config.map(|config| {
+            log::info!("Initializing circuit breaker for Phoenix operations");
+            Arc::new(crate::circuit_breaker::CircuitBreaker::new(config))
+        });
+
         let bridge = Self {
             channel,
             topic: topic.to_string(),
             retry_queue_tx,
             retry_config: retry_config.clone(),
+            circuit_breaker,
         };
 
         // Spawn background task to process retry queue
@@ -251,16 +257,40 @@ impl PhoenixBridge {
     async fn try_send_update(&self, update: &TelegramUpdate) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json_value = serde_json::to_value(update)?;
 
-        // Send with 10 second timeout
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.channel.send_noreply("telegram_update", json_value)
-        ).await
-        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-            "Phoenix send_noreply timed out after 10 seconds".into()
-        })??;
+        // If circuit breaker is enabled, wrap the send operation
+        if let Some(ref cb) = self.circuit_breaker {
+            let channel = Arc::clone(&self.channel);
+            let result = cb.call(|| async move {
+                // Send with 10 second timeout
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    channel.send_noreply("telegram_update", json_value)
+                ).await
+                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    "Phoenix send_noreply timed out after 10 seconds".into()
+                })?
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            }).await;
 
-        Ok(())
+            match result {
+                Ok(_) => Ok(()),
+                Err(crate::circuit_breaker::CircuitBreakerError::Open) => {
+                    Err("Circuit breaker is open - Phoenix operations temporarily blocked".into())
+                }
+                Err(crate::circuit_breaker::CircuitBreakerError::Inner(e)) => Err(e),
+            }
+        } else {
+            // No circuit breaker - send directly
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.channel.send_noreply("telegram_update", json_value)
+            ).await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "Phoenix send_noreply timed out after 10 seconds".into()
+            })??;
+
+            Ok(())
+        }
     }
 
     /// Отправляет update в Phoenix Channel (fire-and-forget, без ожидания ответа)
@@ -338,17 +368,41 @@ impl PhoenixBridge {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let json_value = serde_json::to_value(&update)?;
 
-        // send_with_timeout = ждем ответ от сервера (более медленно, но надежно)
-        // Add outer 10 second timeout (inner timeout is 5 seconds)
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            self.channel.send_with_timeout("telegram_update", json_value, Some(Duration::from_secs(5)))
-        ).await
-        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-            "Phoenix send_with_timeout timed out after 10 seconds".into()
-        })??;
+        // If circuit breaker is enabled, wrap the send operation
+        if let Some(ref cb) = self.circuit_breaker {
+            let channel = Arc::clone(&self.channel);
+            let result = cb.call(|| async move {
+                // send_with_timeout = ждем ответ от сервера (более медленно, но надежно)
+                // Add outer 10 second timeout (inner timeout is 5 seconds)
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    channel.send_with_timeout("telegram_update", json_value, Some(Duration::from_secs(5)))
+                ).await
+                .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                    "Phoenix send_with_timeout timed out after 10 seconds".into()
+                })?
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })
+            }).await;
 
-        Ok(())
+            match result {
+                Ok(_) => Ok(()),
+                Err(crate::circuit_breaker::CircuitBreakerError::Open) => {
+                    Err("Circuit breaker is open - Phoenix operations temporarily blocked".into())
+                }
+                Err(crate::circuit_breaker::CircuitBreakerError::Inner(e)) => Err(e),
+            }
+        } else {
+            // No circuit breaker - send directly
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.channel.send_with_timeout("telegram_update", json_value, Some(Duration::from_secs(5)))
+            ).await
+            .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+                "Phoenix send_with_timeout timed out after 10 seconds".into()
+            })??;
+
+            Ok(())
+        }
     }
 
     pub fn topic(&self) -> &str {
@@ -363,6 +417,7 @@ impl Clone for PhoenixBridge {
             topic: self.topic.clone(),
             retry_queue_tx: self.retry_queue_tx.clone(),
             retry_config: self.retry_config.clone(),
+            circuit_breaker: self.circuit_breaker.as_ref().map(Arc::clone),
         }
     }
 }
@@ -540,34 +595,38 @@ mod tests {
             max_attempts: 3,
         };
 
-        let mut call_count = 0;
-        let operation = || async {
-            call_count += 1;
-            Ok::<i32, String>(42)
-        };
-
-        let result = retry_with_backoff(operation, config, "test").await;
+        let result = retry_with_backoff(
+            || async { Ok::<i32, String>(42) },
+            config,
+            "test"
+        ).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
-        // Note: call_count check won't work due to closure move semantics
     }
 
     #[tokio::test]
     async fn test_retry_with_backoff_success_on_retry() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
         let config = RetryConfig {
             initial_delay_secs: 0, // Use 0 for faster tests
             max_delay_secs: 1,
             max_attempts: 3,
         };
 
-        let mut attempts = 0;
+        let attempts = Arc::new(AtomicU32::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+
         let result = retry_with_backoff(
-            || async {
-                attempts += 1;
-                if attempts < 2 {
-                    Err::<i32, String>("temporary error".to_string())
-                } else {
-                    Ok(42)
+            move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    let count = attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                    if count < 2 {
+                        Err::<i32, String>("temporary error".to_string())
+                    } else {
+                        Ok(42)
+                    }
                 }
             },
             config,
@@ -617,6 +676,7 @@ mod tests {
             "test:topic",
             None,  // No auth token for test
             config,
+            None,  // No circuit breaker for test
         )
         .await;
 
@@ -642,6 +702,7 @@ mod tests {
             "test:topic",
             None,  // No auth token for test
             config,
+            None,  // No circuit breaker for test
         )
         .await;
 
@@ -678,6 +739,7 @@ mod tests {
             "test:topic",
             None,  // No auth token for test
             config,
+            None,  // No circuit breaker for test
         )
         .await;
 
