@@ -26,6 +26,9 @@ pub struct PhoenixConfig {
     pub url: String,
     /// Phoenix channel topic to join
     pub topic: String,
+    /// Optional authentication token for Phoenix channel
+    /// Set via PHOENIX_AUTH_TOKEN environment variable
+    pub auth_token: Option<String>,
     /// Retry configuration for Phoenix operations
     pub retry: RetryConfig,
     /// Timeout for Phoenix connection (in seconds)
@@ -110,6 +113,7 @@ impl Default for PhoenixConfig {
             // For local development, explicitly set PHOENIX_URL=ws://localhost:4000/socket
             url: "wss://localhost:4000/socket".to_string(),
             topic: "telegram:updates".to_string(),
+            auth_token: None,  // No token by default - set via PHOENIX_AUTH_TOKEN
             retry: RetryConfig::default(),
             connection_timeout_secs: 30,
             join_timeout_secs: 30,
@@ -226,6 +230,13 @@ impl PhoenixConfig {
 
         if let Ok(topic) = std::env::var("PHOENIX_TOPIC") {
             config.topic = topic;
+        }
+
+        // Load authentication token if provided
+        if let Ok(token) = std::env::var("PHOENIX_AUTH_TOKEN") {
+            if !token.is_empty() {
+                config.auth_token = Some(token);
+            }
         }
 
         if let Ok(timeout) = std::env::var("PHOENIX_CONNECTION_TIMEOUT_SECS") {
@@ -650,6 +661,7 @@ impl SessionConfigBuilder {
 pub struct PhoenixConfigBuilder {
     url: Option<String>,
     topic: Option<String>,
+    auth_token: Option<Option<String>>,
     retry: Option<RetryConfig>,
     connection_timeout_secs: Option<u64>,
     join_timeout_secs: Option<u64>,
@@ -668,6 +680,11 @@ impl PhoenixConfigBuilder {
 
     pub fn topic(mut self, topic: impl Into<String>) -> Self {
         self.topic = Some(topic.into());
+        self
+    }
+
+    pub fn auth_token(mut self, token: Option<String>) -> Self {
+        self.auth_token = Some(token);
         self
     }
 
@@ -696,6 +713,7 @@ impl PhoenixConfigBuilder {
         PhoenixConfig {
             url: self.url.unwrap_or(default.url),
             topic: self.topic.unwrap_or(default.topic),
+            auth_token: self.auth_token.unwrap_or(default.auth_token),
             retry: self.retry.unwrap_or(default.retry),
             connection_timeout_secs: self.connection_timeout_secs.unwrap_or(default.connection_timeout_secs),
             join_timeout_secs: self.join_timeout_secs.unwrap_or(default.join_timeout_secs),
@@ -998,6 +1016,7 @@ mod tests {
         let valid_ws = PhoenixConfig {
             url: "ws://localhost:4000".to_string(),
             topic: "test:topic".to_string(),
+            auth_token: None,
             retry: RetryConfig::default(),
             connection_timeout_secs: 30,
             join_timeout_secs: 30,

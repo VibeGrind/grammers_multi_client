@@ -177,7 +177,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let phoenix_result = tokio::time::timeout(
         app_config.phoenix.connection_timeout(),
-        PhoenixBridge::new(&app_config.phoenix.url, &app_config.phoenix.topic)
+        PhoenixBridge::new(
+            &app_config.phoenix.url,
+            &app_config.phoenix.topic,
+            app_config.phoenix.auth_token.as_deref()
+        )
     ).await;
 
     let phoenix = match phoenix_result {
@@ -406,6 +410,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         if log::log_enabled!(log::Level::Error) {
                             log::error!("Update error: {:?}", e);
                         }
+
+                        // Check if reconnection is enabled
+                        if app_config.telegram.enable_reconnection {
+                            log::warn!("Connection lost, triggering reconnection...");
+                            // Return error to trigger reconnection
+                            return Err(format!("Update stream error: {:?}", e).into());
+                        } else {
+                            log::warn!("Reconnection disabled, continuing...");
+                        }
                     }
                 }
             }
@@ -447,9 +460,68 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Wrapper function that handles reconnection logic
+async fn run_with_reconnection() -> Result<(), Box<dyn std::error::Error>> {
+    // Load config first to get reconnection settings
+    let app_config = AppConfig::from_env();
+    app_config.validate()?;
+
+    if !app_config.telegram.enable_reconnection {
+        // No reconnection - just run once
+        return run().await;
+    }
+
+    let max_attempts = app_config.telegram.max_reconnection_attempts;
+    let initial_delay = app_config.telegram.reconnection_delay_secs;
+    let max_delay = app_config.telegram.max_reconnection_delay_secs;
+
+    let mut attempt = 0;
+    let mut delay_secs = initial_delay;
+
+    loop {
+        attempt += 1;
+
+        if max_attempts > 0 {
+            log::info!("Connection attempt {}/{}", attempt, max_attempts);
+        } else {
+            log::info!("Connection attempt {} (unlimited retries)", attempt);
+        }
+
+        match run().await {
+            Ok(_) => {
+                log::info!("Program completed successfully");
+                return Ok(());
+            }
+            Err(e) => {
+                log::error!("Connection failed: {}", e);
+
+                // Check if we've exceeded max attempts
+                if max_attempts > 0 && attempt >= max_attempts {
+                    log::error!("Maximum reconnection attempts ({}) reached", max_attempts);
+                    return Err(format!("Failed after {} reconnection attempts", max_attempts).into());
+                }
+
+                // Log reconnection delay
+                log::warn!("Reconnecting in {} seconds...", delay_secs);
+                println!("⚠ Connection lost. Reconnecting in {}s... (attempt {}/{})",
+                    delay_secs,
+                    attempt,
+                    if max_attempts == 0 { "∞".to_string() } else { max_attempts.to_string() }
+                );
+
+                // Wait before reconnecting
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
+                // Exponential backoff with cap
+                delay_secs = (delay_secs * 2).min(max_delay);
+            }
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    if let Err(e) = run().await {
+    if let Err(e) = run_with_reconnection().await {
         eprintln!("Fatal error: {}", e);
         std::process::exit(1);
     }
