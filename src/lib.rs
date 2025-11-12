@@ -6,4 +6,5 @@ pub mod error;
 pub mod storage;
 pub mod config;
 pub mod domain;
+pub mod circuit_breaker;
 // phoenix_bridge is internal and not exported

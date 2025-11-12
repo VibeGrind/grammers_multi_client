@@ -37,6 +37,14 @@ pub struct PhoenixConfig {
     pub join_timeout_secs: u64,
     /// Timeout for Phoenix send operations (in seconds)
     pub send_timeout_secs: u64,
+    /// Enable circuit breaker for Phoenix operations
+    pub enable_circuit_breaker: bool,
+    /// Circuit breaker failure threshold
+    pub circuit_breaker_failure_threshold: u32,
+    /// Circuit breaker success threshold
+    pub circuit_breaker_success_threshold: u32,
+    /// Circuit breaker timeout in seconds
+    pub circuit_breaker_timeout_secs: u64,
 }
 
 /// Retry configuration with exponential backoff
@@ -118,6 +126,10 @@ impl Default for PhoenixConfig {
             connection_timeout_secs: 30,
             join_timeout_secs: 30,
             send_timeout_secs: 10,
+            enable_circuit_breaker: true,  // Enable by default for reliability
+            circuit_breaker_failure_threshold: 5,  // Open after 5 failures
+            circuit_breaker_success_threshold: 2,  // Close after 2 successes
+            circuit_breaker_timeout_secs: 60,  // Wait 60s before retry
         }
     }
 }
@@ -257,6 +269,31 @@ impl PhoenixConfig {
             }
         }
 
+        // Load circuit breaker configuration
+        if let Ok(enabled) = std::env::var("PHOENIX_ENABLE_CIRCUIT_BREAKER") {
+            if let Ok(val) = enabled.parse() {
+                config.enable_circuit_breaker = val;
+            }
+        }
+
+        if let Ok(threshold) = std::env::var("PHOENIX_CIRCUIT_BREAKER_FAILURE_THRESHOLD") {
+            if let Ok(val) = threshold.parse() {
+                config.circuit_breaker_failure_threshold = val;
+            }
+        }
+
+        if let Ok(threshold) = std::env::var("PHOENIX_CIRCUIT_BREAKER_SUCCESS_THRESHOLD") {
+            if let Ok(val) = threshold.parse() {
+                config.circuit_breaker_success_threshold = val;
+            }
+        }
+
+        if let Ok(timeout) = std::env::var("PHOENIX_CIRCUIT_BREAKER_TIMEOUT_SECS") {
+            if let Ok(secs) = timeout.parse() {
+                config.circuit_breaker_timeout_secs = secs;
+            }
+        }
+
         config.retry = RetryConfig::from_env();
 
         config
@@ -318,6 +355,15 @@ impl PhoenixConfig {
     /// Get send timeout as Duration
     pub fn send_timeout(&self) -> Duration {
         Duration::from_secs(self.send_timeout_secs)
+    }
+
+    /// Create a CircuitBreakerConfig from Phoenix config
+    pub fn circuit_breaker_config(&self) -> crate::circuit_breaker::CircuitBreakerConfig {
+        crate::circuit_breaker::CircuitBreakerConfig {
+            failure_threshold: self.circuit_breaker_failure_threshold,
+            success_threshold: self.circuit_breaker_success_threshold,
+            timeout: Duration::from_secs(self.circuit_breaker_timeout_secs),
+        }
     }
 }
 
@@ -666,6 +712,10 @@ pub struct PhoenixConfigBuilder {
     connection_timeout_secs: Option<u64>,
     join_timeout_secs: Option<u64>,
     send_timeout_secs: Option<u64>,
+    enable_circuit_breaker: Option<bool>,
+    circuit_breaker_failure_threshold: Option<u32>,
+    circuit_breaker_success_threshold: Option<u32>,
+    circuit_breaker_timeout_secs: Option<u64>,
 }
 
 impl PhoenixConfigBuilder {
@@ -708,6 +758,26 @@ impl PhoenixConfigBuilder {
         self
     }
 
+    pub fn enable_circuit_breaker(mut self, enabled: bool) -> Self {
+        self.enable_circuit_breaker = Some(enabled);
+        self
+    }
+
+    pub fn circuit_breaker_failure_threshold(mut self, threshold: u32) -> Self {
+        self.circuit_breaker_failure_threshold = Some(threshold);
+        self
+    }
+
+    pub fn circuit_breaker_success_threshold(mut self, threshold: u32) -> Self {
+        self.circuit_breaker_success_threshold = Some(threshold);
+        self
+    }
+
+    pub fn circuit_breaker_timeout_secs(mut self, secs: u64) -> Self {
+        self.circuit_breaker_timeout_secs = Some(secs);
+        self
+    }
+
     pub fn build(self) -> PhoenixConfig {
         let default = PhoenixConfig::default();
         PhoenixConfig {
@@ -718,6 +788,10 @@ impl PhoenixConfigBuilder {
             connection_timeout_secs: self.connection_timeout_secs.unwrap_or(default.connection_timeout_secs),
             join_timeout_secs: self.join_timeout_secs.unwrap_or(default.join_timeout_secs),
             send_timeout_secs: self.send_timeout_secs.unwrap_or(default.send_timeout_secs),
+            enable_circuit_breaker: self.enable_circuit_breaker.unwrap_or(default.enable_circuit_breaker),
+            circuit_breaker_failure_threshold: self.circuit_breaker_failure_threshold.unwrap_or(default.circuit_breaker_failure_threshold),
+            circuit_breaker_success_threshold: self.circuit_breaker_success_threshold.unwrap_or(default.circuit_breaker_success_threshold),
+            circuit_breaker_timeout_secs: self.circuit_breaker_timeout_secs.unwrap_or(default.circuit_breaker_timeout_secs),
         }
     }
 }
@@ -1021,6 +1095,10 @@ mod tests {
             connection_timeout_secs: 30,
             join_timeout_secs: 30,
             send_timeout_secs: 10,
+            enable_circuit_breaker: true,
+            circuit_breaker_failure_threshold: 5,
+            circuit_breaker_success_threshold: 2,
+            circuit_breaker_timeout_secs: 60,
         };
         assert!(valid_ws.validate().is_ok());
 
